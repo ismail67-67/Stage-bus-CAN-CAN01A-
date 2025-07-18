@@ -1,5 +1,6 @@
 // ============================================================
 // TP2 - ACQUISITION ETAT COMMODO FEUX VIA CAN BUS
+// Version finale optimisée avec logs clairs et détection réactive
 // ============================================================
 
 #include <SPI.h>
@@ -32,7 +33,7 @@ MCP2515 mcp2515(SPI_CS_PIN);
 #define LED_STOP    13
 #define LED_KLAXON  14
 
-#define POLLING_INTERVAL  200
+#define POLLING_INTERVAL  50
 #define BLINK_INTERVAL    500
 
 // -------------------- STRUCTURE ET ETAT --------------------
@@ -56,6 +57,7 @@ typedef struct {
 
 CommodoState etat = {false, false, false, false, false, false, 0, 0, false, false, false, false, false};
 bool etatClignotement = false;
+bool changementEtat = false;
 
 // -------------------- AFFICHAGE TRAMES ---------------------
 void afficherTrameTX(const char* label, uint8_t reg, uint8_t mask, uint8_t val) {
@@ -108,7 +110,7 @@ void envoyerCommande(uint8_t mask, bool actif, const char* nom) {
   trame.can_dlc = 3;
   trame.data[0] = REG_GPLAT;
   trame.data[1] = mask;
-  trame.data[2] = actif ? 0x00 : mask;
+  trame.data[2] = actif ? mask : 0x00;
   mcp2515.sendMessage(&trame);
   afficherTrameTX(nom, REG_GPLAT, mask, trame.data[2]);
   etat.ackPrinted = false;
@@ -135,18 +137,22 @@ bool traiterMessageCAN(can_frame trame) {
     if (b1 != etat.prevClignGauche) {
       envoyerCommande(MASK_CLIGN_G, b1, "CLIGNOTANT G");
       etat.prevClignGauche = b1;
+      changementEtat = true;
     }
     if (b2 != etat.prevClignDroit) {
       envoyerCommande(MASK_CLIGN_D, b2, "CLIGNOTANT D");
       etat.prevClignDroit = b2;
+      changementEtat = true;
     }
     if (b3 != etat.prevStop) {
       envoyerCommande(MASK_STOP, b3, "STOP");
       etat.prevStop = b3;
+      changementEtat = true;
     }
     if (b4 != etat.prevKlaxon) {
       envoyerCommande(MASK_KLAXON, b4, "KLAXON");
       etat.prevKlaxon = b4;
+      changementEtat = true;
     }
 
     etat.clignGauche = b1;
@@ -178,11 +184,11 @@ void actualiserLEDs() {
 
 void afficherEtat() {
   Serial.println("\n==== ETAT FEUX COMMODO ====");
-  Serial.print("Clignotant Gauche: "); Serial.println(etat.clignGauche ? "ACTIF" : "inactif");
-  Serial.print("Clignotant Droit : "); Serial.println(etat.clignDroit ? "ACTIF" : "inactif");
-  Serial.print("Feu Stop         : "); Serial.println(etat.stop ? "ACTIF" : "inactif");
-  Serial.print("Klaxon           : "); Serial.println(etat.klaxon ? "ACTIF" : "inactif");
-  Serial.print("Warning (Détresse): "); Serial.println(etat.warning ? "ACTIF" : "inactif");
+  Serial.print("Clignotant Gauche : "); Serial.println(etat.clignGauche ? "ACTIF" : "inactif");
+  Serial.print("Clignotant Droit   : "); Serial.println(etat.clignDroit ? "ACTIF" : "inactif");
+  Serial.print("Feu Stop           : "); Serial.println(etat.stop ? "ACTIF" : "inactif");
+  Serial.print("Klaxon             : "); Serial.println(etat.klaxon ? "ACTIF" : "inactif");
+  Serial.print("Warning (Détresse) : "); Serial.println(etat.warning ? "ACTIF" : "inactif");
   Serial.println("===========================");
 }
 
@@ -206,8 +212,9 @@ void loop() {
   struct can_frame trame;
 
   if (mcp2515.readMessage(&trame) == MCP2515::ERROR_OK) {
-    if (traiterMessageCAN(trame)) {
+    if (traiterMessageCAN(trame) && changementEtat) {
       afficherEtat();
+      changementEtat = false;
     }
   }
 
