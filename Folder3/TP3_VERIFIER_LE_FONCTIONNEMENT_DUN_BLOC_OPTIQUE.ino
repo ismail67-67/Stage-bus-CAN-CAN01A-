@@ -1,312 +1,206 @@
-/* ============================================================
- * TP2 - ACQUISITION ETAT COMMODO FEUX VIA CAN BUS
- * ------------------------------------------------------------
- * Programme optimisé pour lire l'état du commodo feux via CAN
- * et contrôler les LEDs en fonction des entrées
- * 
- * Structure:
- * 1. Configuration matérielle
- * 2. Définitions et constantes
- * 3. Structures de données
- * 4. Fonctions CAN Bus
- * 5. Gestion des LEDs
- * 6. Fonctions principales
- * ============================================================
- */
-
-/**************************************************************
- * 1. CONFIGURATION MATERIELLE
- **************************************************************/
+// ============================================================================
+// TP3 - Contrôle des feux avant droit (FVD) via CAN
+// Arduino Uno + MCP2515 - Véhicule Multiplexé Didactique
+// ============================================================================
 #include <SPI.h>
 #include <mcp2515.h>
 
-const int SPI_CS_PIN = 9;          // Broche CS du MCP2515
-MCP2515 mcp2515(SPI_CS_PIN);       // Objet CAN
+const int SPI_CS_PIN = 9;
+MCP2515 mcp2515(SPI_CS_PIN);
 
-/**************************************************************
- * 2. DEFINITIONS ET CONSTANTES
- **************************************************************/
+#define CAN_SPEED CAN_100KBPS
+#define CAN_CLOCK MCP_16MHZ
 
-/* --------------------------
- * Paramètres CAN
- * ------------------------ */
-#define CAN_SPEED CAN_100KBPS      // Vitesse bus CAN
-#define CAN_CLOCK MCP_16MHZ        // Horloge MCP2515
+// Identifiants CAN
+#define ID_IM_FVD   0x0E880000  // Input Message Feux Avant Droit
+#define ID_AIM_FVD  0x0EA00000  // Acquittement IM Feux Avant Droit
 
-/* --------------------------
- * Identifiants CAN (MCP25050)
- * ------------------------ */
-#define ID_IM_COMMODO   0x05081F00 // Input Message (Configuration)
-#define ID_AIM_COMMODO  0x05200000 // Acquittement IM
-#define ID_IRM_COMMODO  0x05041E07 // Information Request Message
-#define ID_OM_COMMODO   0x05400000 // Output Message (Automatique)
+#define REG_GPDDR  0x1F         // Registre direction GPIO
+#define REG_GPLAT  0x1E         // Registre état GPIO
+#define MASK_FVD   0x0F         // Masque pour les 4 bits LSB
 
-/* --------------------------
- * Broches LEDs
- * ------------------------ */
-#define LED_CLIGN_G 11             // D11 - Clignotant gauche
-#define LED_CLIGN_D 12             // D12 - Clignotant droit
-#define LED_STOP    13             // D13 - Stop
-#define LED_KLAXON  14             // D14 - Klaxon
+#define TEMPO_FEUX 3500         // 3.5s pour cycle feux
+#define TEMPO_CLIGNOT 1600      // 1.6s pour clignotant
 
-/* --------------------------
- * Registres MCP25050
- * ------------------------ */
-#define REG_GPDDR  0x1F            // Registre direction I/O
-#define REG_GPLAT  0x1E            // Registre état des ports
-#define REG_IOTEN  0x1C            // Registre interruptions
+// Structure pour l'état des feux FVD
+struct {
+  uint8_t veilleuse : 1;
+  uint8_t code      : 1;
+  uint8_t phare     : 1;
+  uint8_t clign_d   : 1;
+} commandes;
 
-/* --------------------------
- * Masques des entrées/sorties
- * ------------------------ */
-#define MASK_CLIGN_G  (1 << 4)     // GP4 - Clignotant gauche (B1)
-#define MASK_CLIGN_D  (1 << 5)     // GP5 - Clignotant droit (B2)
-#define MASK_STOP     (1 << 6)     // GP6 - Stop
-#define MASK_KLAXON   (1 << 7)     // GP7 - Klaxon
-#define MASK_D8       (1 << 1)     // GP1 - LED D8 (sortie)
+unsigned long dernier_changement = 0;
+unsigned long dernier_clignotement = 0;
+bool clignotant_actif = false;
 
-/* --------------------------
- * Paramètres temporisation
- * ------------------------ */
-#define POLLING_INTERVAL  200      // Intervalle interrogation (ms)
-#define BLINK_INTERVAL    500      // Intervalle clignotement (ms)
-#define DEBOUNCE_DELAY    50       // Anti-rebonds (ms)
-
-/**************************************************************
- * 3. STRUCTURES DE DONNEES
- **************************************************************/
-
-/**
- * @brief Structure pour stocker l'état du commodo
- */
-typedef struct {
-    bool clignGauche;              // Etat clignotant gauche (B1 pressé)
-    bool clignDroit;               // Etat clignotant droit (B2 pressé)
-    bool stop;                     // Etat feu stop
-    bool klaxon;                   // Etat klaxon
-    bool warning;                  // Mode warning (B1 ET B2 pressés)
-    bool ledD8;                    // Etat LED D8
-    unsigned long dernierPoll;     // Dernier polling
-    unsigned long dernierClignotement; // Timer clignotement
-} CommodoState;
-
-/**************************************************************
- * 4. VARIABLES GLOBALES
- **************************************************************/
-CommodoState etatCommando = {false, false, false, false, false, false, 0, 0};
-bool etatClignotement = false;     // Etat courant clignotement
-
-/**************************************************************
- * 5. FONCTIONS CAN BUS
- **************************************************************/
-
-/**
- * @brief Initialise le module CAN
- */
-void initCAN() {
-    SPI.begin();
-    
-    if(mcp2515.reset() != MCP2515::ERROR_OK) {
-        Serial.println("[ERREUR] Reset CAN échoué");
-        while(1);
-    }
-    
-    if(mcp2515.setBitrate(CAN_SPEED, CAN_CLOCK) != MCP2515::ERROR_OK) {
-        Serial.println("[ERREUR] Configuration bitrate");
-        while(1);
-    }
-    
-    if(mcp2515.setNormalMode() != MCP2515::ERROR_OK) {
-        Serial.println("[ERREUR] Activation mode normal");
-        while(1);
-    }
+// ==============================================
+// FONCTION : Afficher l'état des feux
+// ==============================================
+void printFeuxStatus() {
+  Serial.println("\n[ETAT DES FEUX - FVD]");
+  Serial.print("  Veilleuse : "); Serial.println(commandes.veilleuse ? "ON" : "OFF");
+  Serial.print("  Code      : "); Serial.println(commandes.code ? "ON" : "OFF");
+  Serial.print("  Phare     : "); Serial.println(commandes.phare ? "ON" : "OFF");
+  Serial.print("  Cligno D  : "); Serial.println(commandes.clign_d ? "ON" : "OFF");
+  
+  uint8_t val = (commandes.clign_d << 3) | (commandes.phare << 2) |
+                (commandes.code << 1) | commandes.veilleuse;
+  Serial.print("  Valeur binaire : 0b");
+  for (int8_t i = 3; i >= 0; i--) Serial.print((val >> i) & 1);
+  Serial.print(" (0x"); Serial.print(val, HEX); Serial.println(")");
+  Serial.println("----------------------------------");
 }
 
-/**
- * @brief Configure le module MCP25050
- */
-void configurerModule() {
-    struct can_frame trame;
-    
-    // Configuration des directions I/O (GP1 en sortie, autres en entrée)
-    trame.can_id = ID_IM_COMMODO | CAN_EFF_FLAG;
-    trame.can_dlc = 3;
-    trame.data[0] = REG_GPDDR;     // Registre direction
-    trame.data[1] = 0xFF;          // Masque tous bits
-    trame.data[2] = 0xFF & ~MASK_D8; // Tous en entrée sauf GP1
-    
-    if(mcp2515.sendMessage(&trame) != MCP2515::ERROR_OK) {
-        Serial.println("[ERREUR] Envoi configuration I/O");
-        while(1);
-    }
-    
-    // Initialisation LED D8 éteinte (logique inversée)
-    trame.data[0] = REG_GPLAT;     // Registre état
-    trame.data[1] = MASK_D8;       // Masque pour GP1
-    trame.data[2] = MASK_D8;       // GP1 à 1 (LED éteinte - logique inversée)
-    
-    if(mcp2515.sendMessage(&trame) != MCP2515::ERROR_OK) {
-        Serial.println("[ERREUR] Init LED D8");
-        while(1);
-    }
-}
-
-/**
- * @brief Contrôle la LED D8 sur le module
- * @param etat true pour allumer, false pour éteindre
- */
-void controlerLEDD8(bool etat) {
-    struct can_frame trame;
-    
-    trame.can_id = ID_IM_COMMODO | CAN_EFF_FLAG;
-    trame.can_dlc = 3;
-    trame.data[0] = REG_GPLAT;     // Registre état
-    trame.data[1] = MASK_D8;       // Masque pour GP1
-    // Logique inversée: 0 pour allumer, 1 pour éteindre
-    trame.data[2] = etat ? 0x00 : MASK_D8;
-    
-    if(mcp2515.sendMessage(&trame) != MCP2515::ERROR_OK) {
-        Serial.println("[ERREUR] Contrôle LED D8");
-    }
-    
-    etatCommando.ledD8 = etat;  // Mise à jour état interne
-}
-
-/**
- * @brief Demande l'état actuel du commodo
- */
-void demanderEtat() {
-    struct can_frame trame;
-    trame.can_id = ID_IRM_COMMODO | CAN_EFF_FLAG;
-    trame.can_dlc = 1;
-    trame.data[0] = REG_GPLAT;
-    
-    if(mcp2515.sendMessage(&trame) == MCP2515::ERROR_OK) {
-        etatCommando.dernierPoll = millis();
-    } else {
-        Serial.println("[ERREUR] Envoi demande etat");
-    }
-}
-
-/**
- * @brief Traite un message CAN reçu
- * @param trame Message CAN à traiter
- * @return true si message valide traité
- */
-bool traiterMessageCAN(can_frame trame) {
-    if((trame.can_id & 0x1FFFFFFF) == ID_OM_COMMODO && trame.can_dlc >= 2) {
-        // Lecture état des entrées (0 = bouton pressé, 1 = relâché)
-        bool b1Presse = !(trame.data[1] & MASK_CLIGN_G);
-        bool b2Presse = !(trame.data[1] & MASK_CLIGN_D);
-        
-        // Mise à jour de l'état
-        etatCommando.clignGauche = b1Presse;
-        etatCommando.clignDroit = b2Presse;
-        etatCommando.stop = !(trame.data[1] & MASK_STOP);
-        etatCommando.klaxon = !(trame.data[1] & MASK_KLAXON);
-        
-        // Détection mode warning (les DEUX boutons pressés)
-        etatCommando.warning = b1Presse && b2Presse;
-        
-        return true;
-    }
+// ==============================================
+// FONCTION : Initialisation CAN
+// ==============================================
+bool initCAN() {
+  if (mcp2515.reset() != MCP2515::ERROR_OK) {
+    Serial.println("[ERREUR] Reset CAN failed");
     return false;
+  }
+  if (mcp2515.setBitrate(CAN_SPEED, CAN_CLOCK) != MCP2515::ERROR_OK) {
+    Serial.println("[ERREUR] Configuration bitrate");
+    return false;
+  }
+  if (mcp2515.setNormalMode() != MCP2515::ERROR_OK) {
+    Serial.println("[ERREUR] Mode normal");
+    return false;
+  }
+  return true;
 }
 
-/**************************************************************
- * 6. GESTION DES LEDS
- **************************************************************/
+// ==============================================
+// FONCTION : Envoi avec acquittement
+// ==============================================
+bool sendWithAck(uint32_t id, uint32_t ack_id, uint8_t reg, uint8_t mask, uint8_t value) {
+  struct can_frame frame;
+  frame.can_id  = id | CAN_EFF_FLAG;  // Mode étendu
+  frame.can_dlc = 3;                  // 3 octets de données
+  frame.data[0] = reg;                // Registre cible
+  frame.data[1] = mask;               // Masque
+  frame.data[2] = value;              // Valeur
 
-/**
- * @brief Met à jour l'état des LEDs en fonction de l'état du commodo
- */
-void actualiserLEDs() {
-    // Gestion timer clignotement
-    if(millis() - etatCommando.dernierClignotement > BLINK_INTERVAL) {
-        etatClignotement = !etatClignotement;
-        etatCommando.dernierClignotement = millis();
+  // Affichage détaillé de la trame envoyée
+  Serial.println("\n[ENVOI TRAME]");
+  Serial.print("  [RX]ID: 0x"); Serial.println(id, HEX);
+  Serial.print("  Registre: 0x"); Serial.println(reg, HEX);
+  Serial.print("  Masque: 0b"); 
+  for (int8_t i = 7; i >= 0; i--) Serial.print((mask >> i) & 1);
+  Serial.print(" (0x"); Serial.print(mask, HEX); Serial.println(")");
+  Serial.print("  Valeur: 0b"); 
+  for (int8_t i = 7; i >= 0; i--) Serial.print((value >> i) & 1);
+  Serial.print(" (0x"); Serial.print(value, HEX); Serial.println(")");
+
+  if (mcp2515.sendMessage(&frame) != MCP2515::ERROR_OK) {
+    Serial.println("[ERREUR] Envoi trame");
+    return false;
+  }
+
+  // Attente acquittement
+  struct can_frame ack_frame;
+  unsigned long t0 = millis();
+  while (millis() - t0 < 500) {  // Timeout 500ms
+    if (mcp2515.readMessage(&ack_frame) == MCP2515::ERROR_OK) {
+      if ((ack_frame.can_id & 0x1FFFFFFF) == ack_id) {
+        Serial.println("\n[ACQUITTEMENT RECU]");
+        Serial.print(" [TX]ID: 0x"); Serial.println(ack_id, HEX);
+        Serial.print("  Module: Feux Avant Droit");
+        Serial.println("\n----------------------------------");
+        return true;
+      }
     }
-    
-    // Mode warning (les deux boutons pressés)
-    if(etatCommando.warning) {
-        digitalWrite(LED_CLIGN_G, etatClignotement);
-        digitalWrite(LED_CLIGN_D, etatClignotement);
-        
-        // Allumer LED D8 seulement en mode warning
-        if(!etatCommando.ledD8) {
-            controlerLEDD8(true);
-        }
-    } else {
-        // Clignotants normaux
-        digitalWrite(LED_CLIGN_G, etatCommando.clignGauche ? etatClignotement : LOW);
-        digitalWrite(LED_CLIGN_D, etatCommando.clignDroit ? etatClignotement : LOW);
-        
-        // Eteindre LED D8 si pas en mode warning
-        if(etatCommando.ledD8) {
-            controlerLEDD8(false);
-        }
-    }
-    
-    // Feux stop et klaxon (pas de clignotement)
-    digitalWrite(LED_STOP, etatCommando.stop ? HIGH : LOW);
-    digitalWrite(LED_KLAXON, etatCommando.klaxon ? HIGH : LOW);
+  }
+  Serial.println("[ERREUR] Timeout acquittement");
+  return false;
 }
 
-/**
- * @brief Affiche l'état courant du commodo sur le port série
- */
-void afficherEtat() {
-    Serial.println("\n==== ETAT FEUX COMMODO ====");
-    Serial.print("Clignotant Gauche: "); Serial.println(etatCommando.clignGauche ? "ACTIF" : "inactif");
-    Serial.print("Clignotant Droit:  "); Serial.println(etatCommando.clignDroit ? "ACTIF" : "inactif");
-    Serial.print("Stop:              "); Serial.println(etatCommando.stop ? "ACTIF" : "inactif");
-    Serial.print("Klaxon:            "); Serial.println(etatCommando.klaxon ? "ACTIF" : "inactif");
-    Serial.print("Warning (Détresse):"); Serial.println(etatCommando.warning ? "ACTIF" : "inactif");
-    Serial.println("===========================");
+// ==============================================
+// FONCTION : Mise à jour cycle feux
+// ==============================================
+void updateFeux() {
+  static uint8_t cycle = 0;
+
+  Serial.print("\n[CYCLE FEUX] Phase "); Serial.println(cycle);
+  
+  // Séquence: OFF -> Veilleuse -> Code -> Phare
+  switch (cycle) {
+    case 0:  // Tout éteint
+      commandes.veilleuse = 0; 
+      commandes.code = 0; 
+      commandes.phare = 0; 
+      break;
+    case 1:  // Veilleuse
+      commandes.veilleuse = 1; 
+      break;
+    case 2:  // Code
+      commandes.code = 1; 
+      break;
+    case 3:  // Phare
+      commandes.code = 0; 
+      commandes.phare = 1; 
+      break;
+  }
+  cycle = (cycle + 1) % 4;
+
+  // Construction valeur et envoi
+  uint8_t val_fvd = (commandes.clign_d << 3) | (commandes.phare << 2) |
+                    (commandes.code << 1) | commandes.veilleuse;
+  sendWithAck(ID_IM_FVD, ID_AIM_FVD, REG_GPLAT, MASK_FVD, val_fvd);
+  printFeuxStatus();
 }
 
-/**************************************************************
- * 7. FONCTIONS PRINCIPALES
- **************************************************************/
-
+// ==============================================
+// SETUP
+// ==============================================
 void setup() {
-    // Configuration des broches LEDs
-    pinMode(LED_CLIGN_G, OUTPUT);
-    pinMode(LED_CLIGN_D, OUTPUT);
-    pinMode(LED_STOP, OUTPUT);
-    pinMode(LED_KLAXON, OUTPUT);
-    
-    // Initialisation port série
-    Serial.begin(115200);
-    while(!Serial); // Attente connexion pour les cartes avec USB
-    
-    Serial.println("\nInitialisation système...");
-    
-    // Initialisation CAN
-    initCAN();
-    configurerModule();
-    
-    // Première demande d'état
-    demanderEtat();
-    
-    Serial.println("Système prêt");
+  Serial.begin(115200);
+  while (!Serial); // Attente connexion série
+  SPI.begin();
+  
+  Serial.println("\nInitialisation CAN...");
+  if (!initCAN()) {
+    Serial.println("[ERREUR] Initialisation CAN echouee");
+    while (1); // Boucle infinie
+  }
+  
+  // Initialisation état feux
+  commandes = {0, 0, 0, 0};
+  
+  // Configuration initiale des GPIO en sortie
+  if (!sendWithAck(ID_IM_FVD, ID_AIM_FVD, REG_GPDDR, 0x0F, 0x00)) {
+    Serial.println("[ERREUR] Config GPIO");
+    while (1);
+  }
+  
+  Serial.println("\n[SYSTEME PRET] Controle Feux Avant Droit");
+  Serial.println("==================================");
 }
 
+// ==============================================
+// LOOP
+// ==============================================
 void loop() {
-    struct can_frame trame;
-    
-    // Lecture des messages CAN
-    if(mcp2515.readMessage(&trame) == MCP2515::ERROR_OK) {
-        if(traiterMessageCAN(trame)) {
-            afficherEtat();
-        }
-    }
-    
-    // Polling périodique de l'état
-    if(millis() - etatCommando.dernierPoll >= POLLING_INTERVAL) {
-        demanderEtat();
-    }
-    
-    // Mise à jour des LEDs
-    actualiserLEDs();
+  unsigned long now = millis();
+
+  // Gestion cycle feux principal
+  if (now - dernier_changement >= TEMPO_FEUX) {
+    dernier_changement = now;
+    updateFeux();
+  }
+
+  // Gestion clignotant indépendant
+  if (now - dernier_clignotement >= TEMPO_CLIGNOT) {
+    dernier_clignotement = now;
+    clignotant_actif = !clignotant_actif;
+    commandes.clign_d = clignotant_actif ? 1 : 0;
+
+    uint8_t val_fvd = (commandes.clign_d << 3) | (commandes.phare << 2) |
+                      (commandes.code << 1) | commandes.veilleuse;
+    sendWithAck(ID_IM_FVD, ID_AIM_FVD, REG_GPLAT, MASK_FVD, val_fvd);
+    printFeuxStatus();
+  }
+  
+  delay(100); // Petite pause
 }
