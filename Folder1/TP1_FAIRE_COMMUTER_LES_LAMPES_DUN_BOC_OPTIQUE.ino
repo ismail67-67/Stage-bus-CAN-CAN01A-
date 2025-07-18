@@ -1,404 +1,240 @@
-/* 
- * Programme de contrôle des feux automobile via CAN
- * TP3 - Véhicule Multiplexé Didactique
- * 
- * Fonctionnalités :
- * - Cycle automatique des états des feux (3.5s)
- * - Gestion des clignotants (1.6s)
- * - Communication CAN avec les modules MCP25050
- * - Lecture des états du commodo
- * - Affichage debug des trames CAN
- */
+/*******************************************************************************
+ *  TP1 - Chenillard VMD avec Arduino Uno R3 et MCP2515
+ *  
+ *  Description: 
+ *    Ce programme implémente un chenillard sur les feux avant droit d'un véhicule
+ *    didactique utilisant le bus CAN. Il suit les spécifications du TP1 du manuel
+ *    VMD avec des améliorations pour l'Arduino.
+ *  
+ *  Fonctionnement:
+ *    - Séquence cyclique: Veilleuse -> Code -> Phare -> Clignotant droit -> Eteint
+ *    - Communication CAN avec le module MCP25050
+ *    - Affichage détaillé sur le moniteur série
+ *  
+ *  Matériel:
+ *    - Arduino Uno R3
+ *    - Module CAN MCP2515
+ *    - Module VMD avec feux avant droit
+ *******************************************************************************/
 
-// 1. INCLUSIONS ET CONFIGURATION
-//--------------------------------------------------------------------------------
 #include <SPI.h>
-#include <mcp2515.h>
+#include "mcp2515.h"
 
-// Configuration matérielle
-const int SPI_CS_PIN = 9;  // Broche CS pour le module CAN
-MCP2515 mcp2515(SPI_CS_PIN);
+// =============================================================================
+//                           CONFIGURATION MATERIEL
+// =============================================================================
 
-// Configuration CAN
-#define CAN_SPEED CAN_100KBPS  // Vitesse du bus CAN
-#define CAN_CLOCK MCP_16MHZ    // Fréquence du quartz
-#define DEBUG_MODE 1           // Activer les messages de debug
+const int SPI_CS_PIN = 9;       // Broche CS pour le MCP2515
+MCP2515 mcp2515(SPI_CS_PIN);    // Objet de contrôle du CAN
 
-// 2. DÉFINITIONS DES IDENTIFIANTS CAN
-//--------------------------------------------------------------------------------
-// Identifiants pour le module COMMODO
-#define ID_IM_COMMODO   0x05080000  // Input Message
-#define ID_IRM_COMMODO  0x05041E07  // Information Request Message
-#define ID_AIM_COMMODO  0x05200000  // Acknowledge Input Message
+// =============================================================================
+//                            PARAMETRES CAN
+// =============================================================================
 
-// Identifiants pour le module FVD (Feux Avant Droit)
-#define ID_IM_FVD   0x0E880000  // Input Message
-#define ID_AIM_FVD  0x0EA00000  // Acknowledge Input Message  
-#define ID_IRM_FVD  0x0E841E07  // Information Request Message
+// Identifiants CAN (29 bits) pour les feux avant droit
+#define ID_IM  0x0E880000  // Identifiant Input Message (écriture registre RXF1)
+#define ID_AIM 0x0EA00000  // Identifiant Acquittement (réponse du module TXD1)
 
-// 3. DÉFINITIONS DES REGISTRES MCP25050
-//--------------------------------------------------------------------------------
-#define REG_GPDDR  0x1F  // Registre de direction des broches (I/O)
-#define REG_GPLAT  0x1E  // Registre des états de sortie
-#define REG_GPPIN  0x1E  // Registre de lecture des entrées (équivalent à GPLAT)
+// Adresses des registres du MCP25050
+#define REG_GPDDR 0x1F  // Registre de direction des GPIO
+#define REG_GPLAT 0x1E  // Registre d'état des sorties
 
-// 4. MASQUES DE CONFIGURATION
-//--------------------------------------------------------------------------------
-#define MASK_COMMODO 0x3F  // Masque pour le COMMODO (bits 0-5)
-#define MASK_FVD     0x0F  // Masque pour le FVD (bits 0-3)
+// Masques pour les broches
+#define MASQUE_SORTIES 0x0F  // Masque pour les 4 bits de sortie (GP0-GP3)
 
-// 5. PARAMÈTRES DE TEMPORISATION (ms)
-//--------------------------------------------------------------------------------
-#define TEMPO_FEUX 3500     // 3.5s - Changement d'état des feux
-#define TEMPO_CLIGNOT 1600  // 1.6s - Période de clignotement
-#define TEMPO_LECTURE 1000  // 1.0s - Période de lecture des états
+// =============================================================================
+//                             ETATS DES FEUX
+// =============================================================================
 
-// 6. STRUCTURES DE DONNÉES
-//--------------------------------------------------------------------------------
-// Structure pour les commandes et états des feux
-struct {
-  // Commandes (sorties)
-  uint8_t veilleuse : 1;    // GP0
-  uint8_t warning : 1;      // GP1
-  uint8_t phare : 1;        // GP2
-  uint8_t code : 1;         // GP3
-  uint8_t clign_g : 1;      // GP4
-  uint8_t clign_d : 1;      // GP5
+// Définition des états des feux avec leur nom
+typedef struct {
+  uint8_t valeur;       // Valeur hexadécimale
+  const char* nom;      // Nom de la lampe
+} EtatFeux;
+
+const EtatFeux etatsFeux[] = {
+  {0x01, "Veilleuse"},
+  {0x02, "Code"},
+  {0x04, "Phare"},
+  {0x08, "Clignotant droit"},
+  {0x00, "Feux eteints"}
+};
+
+const int nbEtats = sizeof(etatsFeux) / sizeof(etatsFeux[0]);
+int indexEtat = 0;              // Index de l'état courant
+unsigned long compteur = 0;     // Compteur pour la temporisation
+bool erreurInit = false;        // Flag d'erreur d'initialisation
+
+// =============================================================================
+//                          FONCTIONS CAN
+// =============================================================================
+
+/**
+ * Envoie une trame CAN et attend l'acquittement
+ * 
+ * @param registre Adresse du registre à modifier
+ * @param masque Masque des bits à modifier
+ * @param valeur Valeur à écrire
+ * @return true si acquittement reçu, false sinon
+ */
+bool envoyerTrameCAN(uint8_t registre, uint8_t masque, uint8_t valeur) {
+  // Préparation de la trame
+  struct can_frame trame;
+  trame.can_id = ID_IM | CAN_EFF_FLAG;  // Mode étendu (29 bits)
+  trame.can_dlc = 3;                    // 3 octets de données
+  trame.data[0] = registre;             // Octet 0: adresse registre
+  trame.data[1] = masque;               // Octet 1: masque
+  trame.data[2] = valeur;               // Octet 2: valeur
   
-  // États lus (entrées)
-  uint8_t status_veilleuse : 1;
-  uint8_t status_warning : 1;
-  uint8_t status_phare : 1;
-  uint8_t status_code : 1;
-  uint8_t status_clign_g : 1;
-  uint8_t status_clign_d : 1;
-} commandes, etat;
+  // Affichage de la trame envoyée
+  Serial.print(">>> Envoi CAN - ID: 0x");
+  Serial.print(ID_IM, HEX);
+  Serial.print(" | Registre: 0x");
+  Serial.print(registre, HEX);
+  Serial.print(" | Masque: 0x");
+  Serial.print(masque, HEX);
+  Serial.print(" | Valeur: 0x");
+  Serial.println(valeur, HEX);
 
-// Variables de temporisation
-unsigned long dernier_changement = 0;
-unsigned long dernier_clignotement = 0;
-unsigned long dernier_lecture = 0;
-bool clignotant_actif = false;
+  // Vider le buffer de réception
+  struct can_frame ack;
+  while (mcp2515.readMessage(&ack) == MCP2515::ERROR_OK);
 
-// 7. FONCTIONS D'AIDE ET DEBUG
-//--------------------------------------------------------------------------------
-/**
- * Affiche un message de debug sur le port série
- * @param message Le message à afficher
- */
-void printDebug(String message) {
-  #if DEBUG_MODE
-    Serial.println("[DEBUG] " + message);
-  #endif
-}
-
-/**
- * Affiche le contenu d'une trame CAN
- * @param frame La trame CAN à afficher
- * @param isReceived True si trame reçue, false si émise
- */
-void printFrame(const can_frame &frame, bool isReceived) {
-  Serial.print(isReceived ? "[RX] " : "[TX] ");
-  Serial.print("ID: 0x");
-  Serial.print(frame.can_id & 0x1FFFFFFF, HEX);
-  Serial.print(" DLC: ");
-  Serial.print(frame.can_dlc);
-  Serial.print(" Data: ");
-  for (int i = 0; i < frame.can_dlc; i++) {
-    Serial.print("0x");
-    Serial.print(frame.data[i], HEX);
-    Serial.print(" ");
-  }
-  Serial.println();
-}
-
-/**
- * Affiche l'état courant des feux
- */
-void printFeuxStatus() {
-  Serial.println("\n=== ETAT DES FEUX ===");
-  Serial.print("FVD - Veilleuse:");
-  Serial.print(commandes.veilleuse);
-  Serial.print(" Code:");
-  Serial.print(commandes.code);
-  Serial.print(" Phare:");
-  Serial.print(commandes.phare);
-  Serial.print(" Cligno D:");
-  Serial.println(commandes.clign_d);
-}
-
-// 8. FONCTIONS DE COMMUNICATION CAN
-//--------------------------------------------------------------------------------
-/**
- * Initialise la communication CAN
- * @return True si succès, false sinon
- */
-bool initCAN() {
-  if(mcp2515.reset() != MCP2515::ERROR_OK) {
-    printDebug("Erreur reset CAN");
+  // Envoi de la trame
+  if (mcp2515.sendMessage(&trame) != MCP2515::ERROR_OK) {
+    Serial.println("!!! Erreur lors de l'envoi de la trame");
     return false;
   }
-  
-  if(mcp2515.setBitrate(CAN_SPEED, CAN_CLOCK) != MCP2515::ERROR_OK) {
-    printDebug("Erreur bitrate CAN");
-    return false;
-  }
-  
-  if(mcp2515.setNormalMode() != MCP2515::ERROR_OK) {
-    printDebug("Erreur mode normal CAN");
-    return false;
-  }
-  
-  printDebug("CAN initialise");
-  return true;
-}
 
-/**
- * Envoie un message CAN
- * @param id Identifiant CAN
- * @param reg Registre cible
- * @param mask Masque à appliquer
- * @param val Valeur à écrire
- * @return True si succès, false sinon
- */
-bool sendMessage(uint32_t id, uint8_t reg, uint8_t mask, uint8_t val) {
-  struct can_frame msg;
-  msg.can_id = id | CAN_EFF_FLAG;  // Mode étendu
-  msg.can_dlc = 3;                 // 3 octets de données
-  msg.data[0] = reg;               // Adresse registre
-  msg.data[1] = mask;              // Masque
-  msg.data[2] = val;               // Valeur
-
-  printFrame(msg, false);
-  
-  if(mcp2515.sendMessage(&msg) != MCP2515::ERROR_OK) {
-    printDebug("Echec envoi message ID: 0x" + String(id, HEX));
-    return false;
-  }
-  return true;
-}
-
-/**
- * Lit un message CAN avec timeout
- * @param expected_id Identifiant attendu
- * @param data Buffer pour les données
- * @param timeout Délai d'attente (ms)
- * @return True si message valide reçu, false sinon
- */
-bool readMessage(uint32_t expected_id, uint8_t* data, uint16_t timeout = 500) {
-  struct can_frame frame;
-  unsigned long t0 = millis();
-  
-  while(millis() - t0 < timeout) {
-    if(mcp2515.readMessage(&frame) == MCP2515::ERROR_OK) {
-      printFrame(frame, true);
-      if((frame.can_id & 0x1FFFFFFF) == expected_id) {
-        memcpy(data, frame.data, frame.can_dlc);
+  // Attente de l'acquittement (200ms max)
+  unsigned long debutAttente = millis();
+  while (millis() - debutAttente < 200) {
+    if (mcp2515.readMessage(&ack) == MCP2515::ERROR_OK) {
+      if ((ack.can_id & 0x1FFFFFFF) == ID_AIM) {
+        Serial.print("<<< Acquittement recu - ID: 0x");
+        Serial.println(ID_AIM, HEX);
         return true;
       }
     }
   }
+  
+  Serial.println("!!! Timeout - Pas d'acquittement recu");
   return false;
 }
 
-// 9. CONFIGURATION DES MODULES
-//--------------------------------------------------------------------------------
-/**
- * Configure un module CAN
- * @param im_id ID pour Input Message
- * @param aim_id ID pour Acknowledge
- * @param mask Masque à appliquer
- * @param init_val Valeur initiale
- * @param is_output True pour sortie, false pour entrée
- * @return True si succès, false sinon
- */
-bool configModule(uint32_t im_id, uint32_t aim_id, uint8_t mask, uint8_t init_val, bool is_output) {
-  // Configuration GPDDR (direction des broches)
-  uint8_t gpddr_val = is_output ? 0x00 : 0xFF;
-  
-  if(!sendMessage(im_id, REG_GPDDR, mask, gpddr_val)) {
-    printDebug("Erreur config GPDDR");
-    return false;
-  }
-  
-  // Attendre ACK
-  uint8_t ack_data[8];
-  if(!readMessage(aim_id, ack_data)) {
-    printDebug("Timeout ACK config GPDDR");
-    return false;
-  }
-  
-  // Initialisation GPLAT (état des sorties)
-  if(is_output && !sendMessage(im_id, REG_GPLAT, mask, init_val)) {
-    printDebug("Erreur config GPLAT");
-    return false;
-  }
-  
-  return true;
-}
-
-// 10. GESTION DES ÉTATS DES FEUX
-//--------------------------------------------------------------------------------
-/**
- * Met à jour l'état des feux selon le cycle prédéfini
- */
-void updateFeux() {
-  static uint8_t cycle = 0;
-  const char* etats[] = {"Tout eteint", "Veilleuse", "Veilleuse+Code", "Veilleuse+Phare"};
-  
-  Serial.print("Etat suivant des feux: ");
-  Serial.println(etats[cycle]);
-  
-  // Cycle pour FVD (3.5s entre chaque changement)
-  switch(cycle) {
-    case 0: // Tout éteint
-      commandes.veilleuse = 0;
-      commandes.code = 0;
-      commandes.phare = 0;
-      cycle = 1;
-      break;
-    case 1: // Veilleuse
-      commandes.veilleuse = 1;
-      cycle = 2;
-      break;
-    case 2: // Veilleuse + Code
-      commandes.code = 1;
-      cycle = 3;
-      break;
-    case 3: // Veilleuse + Phare
-      commandes.code = 0;
-      commandes.phare = 1;
-      cycle = 0;
-      break;
-  }
-  
-  // Envoi commande FVD (NON inversé)
-  uint8_t val_fvd = (commandes.clign_d << 3) | 
-                   (commandes.phare << 2) | 
-                   (commandes.code << 1) | 
-                   commandes.veilleuse;
-  
-  if(!sendMessage(ID_IM_FVD, REG_GPLAT, MASK_FVD, val_fvd)) {
-    printDebug("Echec commande FVD");
-  }
-  
-  // Envoi commande COMMODO (INVERSÉ)
-  uint8_t val_commodo = ((!commandes.clign_d) << 5) | 
-                       ((!commandes.clign_g) << 4) |
-                       ((!commandes.code) << 3) | 
-                       ((!commandes.phare) << 2) | 
-                       ((!commandes.warning) << 1) | 
-                       (!commandes.veilleuse);
-  
-  if(!sendMessage(ID_IM_COMMODO, REG_GPLAT, MASK_COMMODO, val_commodo)) {
-    printDebug("Echec commande COMMODO");
-  }
-  
-  // Lecture état du commodo après commande
-  readCommodoStatus();
-  printFeuxStatus();
-}
+// =============================================================================
+//                     FONCTIONS D'INITIALISATION
+// =============================================================================
 
 /**
- * Lit l'état actuel du commodo
- * @return True si succès, false sinon
+ * Initialise la communication CAN
  */
-bool readCommodoStatus() {
-  // Envoi demande de lecture du registre GPPIN du COMMODO
-  struct can_frame msg;
-  msg.can_id = ID_IRM_COMMODO | CAN_EFF_FLAG;
-  msg.can_dlc = 1;
-  msg.data[0] = REG_GPPIN;
+void initialiserCAN() {
+  Serial.println("Initialisation du module CAN...");
   
-  if(mcp2515.sendMessage(&msg) != MCP2515::ERROR_OK) {
-    printDebug("Echec demande lecture COMMODO");
-    return false;
-  }
-  
-  return true;
-}
-
-// 11. SETUP ET LOOP PRINCIPALE
-//--------------------------------------------------------------------------------
-void setup() {
-  // Initialisation port série
-  Serial.begin(115200);
-  while(!Serial); // Attendre connexion série
-  
-  // Initialisation SPI
   SPI.begin();
   
-  // Initialisation CAN
-  if(!initCAN()) {
-    Serial.println("ERREUR INIT CAN");
-    while(1);
+  // Réinitialisation du MCP2515
+  if (mcp2515.reset() != MCP2515::ERROR_OK) {
+    Serial.println("!!! Erreur de reset du MCP2515");
+    while (1);
   }
   
-  // Configuration COMMODO (sorties pour GP0-GP5)
-  if(!configModule(ID_IM_COMMODO, ID_AIM_COMMODO, MASK_COMMODO, 0x3F, true)) {
-    Serial.println("ERREUR CONFIG COMMODO");
+  // Configuration du débit (100kbps pour le VMD)
+  if (mcp2515.setBitrate(CAN_100KBPS, MCP_16MHZ) != MCP2515::ERROR_OK) {
+    Serial.println("!!! Erreur de configuration du debit CAN");
+    while (1);
   }
+
+  // Passage en mode normal
+  mcp2515.setNormalMode();
+  Serial.println("Module CAN initialise avec succes");
+}
+
+/**
+ * Configure le module VMD
+ */
+void configurerModuleVMD() {
+  Serial.println("\nConfiguration du module VMD...");
   
-  // Configuration FVD (sorties)
-  if(!configModule(ID_IM_FVD, ID_AIM_FVD, MASK_FVD, 0x00, true)) {
-    Serial.println("ERREUR CONFIG FVD");
+  // Configuration des broches GP0-GP3 en sortie (broches 4-7 en entrée)
+  Serial.println("Configuration des directions des GPIO...");
+  if (!envoyerTrameCAN(REG_GPDDR, 0x7F, 0xF0)) {
+    Serial.println("!!! Erreur de configuration GPDDR");
+    erreurInit = true;
+    return;
   }
+
+  // Éteindre toutes les lampes initialement
+  Serial.println("Extinction des feux initiaux...");
+  if (!envoyerTrameCAN(REG_GPLAT, MASQUE_SORTIES, 0x00)) {
+    Serial.println("!!! Erreur d'initialisation GPLAT");
+    erreurInit = true;
+    return;
+  }
+
+  Serial.println("Module VMD configure avec succes");
+}
+
+// =============================================================================
+//                     FONCTIONS DE GESTION DES FEUX
+// =============================================================================
+
+/**
+ * Passe à l'état suivant du chenillard
+ */
+void changerEtatFeux() {
+  // Passage à l'état suivant
+  indexEtat = (indexEtat + 1) % nbEtats;
   
-  // Initialisation des commandes (tout éteint)
-  commandes.veilleuse = 0;
-  commandes.warning = 0;
-  commandes.phare = 0;
-  commandes.code = 0;
-  commandes.clign_g = 0;
-  commandes.clign_d = 0;
+  // Récupération de l'état courant
+  EtatFeux etatCourant = etatsFeux[indexEtat];
   
-  Serial.println("\nSysteme pret");
-  Serial.println("Configuration initiale:");
-  printFeuxStatus();
+  // Affichage de l'état
+  Serial.print("\n=== Changement d'etat: ");
+  Serial.print(etatCourant.nom);
+  Serial.print(" (0x");
+  Serial.print(etatCourant.valeur, HEX);
+  Serial.println(") ===");
+
+  // Envoi de la commande CAN
+  if (!envoyerTrameCAN(REG_GPLAT, MASQUE_SORTIES, etatCourant.valeur)) {
+    Serial.println("!!! Erreur lors du changement d'etat");
+  }
+}
+
+// =============================================================================
+//                            SETUP & LOOP
+// =============================================================================
+
+void setup() {
+  // Initialisation du port série
+  Serial.begin(115200);
+  while (!Serial); // Attendre l'ouverture du port
+  
+  Serial.println("\n=== TP1 - Chenillard VMD avec Arduino ===");
+  Serial.println("=== Systeme de feux avant droit ===");
+  
+  // Initialisations
+  initialiserCAN();
+  configurerModuleVMD();
+  
+  // Vérification de l'initialisation
+  if (erreurInit) {
+    Serial.println("\n!!! Erreur d'initialisation - Systeme bloque !!!");
+  } else {
+    Serial.println("\nSysteme pret - Demarrage du chenillard");
+  }
 }
 
 void loop() {
-  unsigned long maintenant = millis();
+  // Ne rien faire si erreur d'initialisation
+  if (erreurInit) return;
   
-  // Changement d'état des feux (toutes les 3.5s)
-  if(maintenant - dernier_changement >= TEMPO_FEUX) {
-    dernier_changement = maintenant;
-    updateFeux();
+  // Temporisation basée sur le comptage (comme l'original EID210)
+  compteur++;
+  if (compteur >= 400000) {
+    compteur = 0;
+    changerEtatFeux();
   }
-  
-  // Clignotant (toutes les 1.6s)
-  if(maintenant - dernier_clignotement >= TEMPO_CLIGNOT) {
-    dernier_clignotement = maintenant;
-    clignotant_actif = !clignotant_actif;
-    commandes.clign_d = clignotant_actif ? 1 : 0;
-    
-    // Envoi immédiat de la commande clignotant
-    // FVD (NON inversé)
-    uint8_t val_fvd = (commandes.clign_d << 3) | 
-                     (commandes.phare << 2) | 
-                     (commandes.code << 1) | 
-                     commandes.veilleuse;
-    
-    if(!sendMessage(ID_IM_FVD, REG_GPLAT, MASK_FVD, val_fvd)) {
-      printDebug("Echec commande clignotant FVD");
-    }
-    
-    // COMMODO (INVERSÉ)
-    uint8_t val_commodo = ((!commandes.clign_d) << 5) | 
-                         ((!commandes.clign_g) << 4) |
-                         ((!commandes.code) << 3) | 
-                         ((!commandes.phare) << 2) | 
-                         ((!commandes.warning) << 1) | 
-                         (!commandes.veilleuse);
-    
-    if(!sendMessage(ID_IM_COMMODO, REG_GPLAT, MASK_COMMODO, val_commodo)) {
-      printDebug("Echec commande clignotant COMMODO");
-    }
-    
-    // Lecture état après commande
-    readCommodoStatus();
-    printFeuxStatus();
-  }
-  
-  delay(100);  // Petite pause pour éviter la surcharge CPU
 }
