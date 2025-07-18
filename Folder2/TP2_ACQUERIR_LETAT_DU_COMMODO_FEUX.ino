@@ -1,6 +1,5 @@
 // ============================================================
 // TP2 - ACQUISITION ETAT COMMODO FEUX VIA CAN BUS
-// Version finale optimisée avec logs clairs et détection réactive
 // ============================================================
 
 #include <SPI.h>
