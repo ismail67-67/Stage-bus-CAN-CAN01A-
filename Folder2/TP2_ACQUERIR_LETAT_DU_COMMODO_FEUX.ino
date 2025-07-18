@@ -1,240 +1,219 @@
-/*******************************************************************************
- *  TP1 - Chenillard VMD avec Arduino Uno R3 et MCP2515
- *  
- *  Description: 
- *    Ce programme implémente un chenillard sur les feux avant droit d'un véhicule
- *    didactique utilisant le bus CAN. Il suit les spécifications du TP1 du manuel
- *    VMD avec des améliorations pour l'Arduino.
- *  
- *  Fonctionnement:
- *    - Séquence cyclique: Veilleuse -> Code -> Phare -> Clignotant droit -> Eteint
- *    - Communication CAN avec le module MCP25050
- *    - Affichage détaillé sur le moniteur série
- *  
- *  Matériel:
- *    - Arduino Uno R3
- *    - Module CAN MCP2515
- *    - Module VMD avec feux avant droit
- *******************************************************************************/
+// ============================================================
+// TP2 - ACQUISITION ETAT COMMODO FEUX VIA CAN BUS
+// ============================================================
 
 #include <SPI.h>
-#include "mcp2515.h"
+#include <mcp2515.h>
 
-// =============================================================================
-//                           CONFIGURATION MATERIEL
-// =============================================================================
+// -------------------- CONFIGURATION ------------------------
+const int SPI_CS_PIN = 9;
+MCP2515 mcp2515(SPI_CS_PIN);
 
-const int SPI_CS_PIN = 9;       // Broche CS pour le MCP2515
-MCP2515 mcp2515(SPI_CS_PIN);    // Objet de contrôle du CAN
+#define CAN_SPEED CAN_100KBPS
+#define CAN_CLOCK MCP_16MHZ
 
-// =============================================================================
-//                            PARAMETRES CAN
-// =============================================================================
+#define ID_IM_COMMODO   0x05081F00
+#define ID_AIM_COMMODO  0x05200000
+#define ID_IRM_COMMODO  0x05041E07
+#define ID_OM_COMMODO   0x05400000
 
-// Identifiants CAN (29 bits) pour les feux avant droit
-#define ID_IM  0x0E880000  // Identifiant Input Message (écriture registre RXF1)
-#define ID_AIM 0x0EA00000  // Identifiant Acquittement (réponse du module TXD1)
+#define REG_GPDDR  0x1F
+#define REG_GPLAT  0x1E
+#define REG_IOTEN  0x1C
 
-// Adresses des registres du MCP25050
-#define REG_GPDDR 0x1F  // Registre de direction des GPIO
-#define REG_GPLAT 0x1E  // Registre d'état des sorties
+#define MASK_CLIGN_G  (1 << 4)
+#define MASK_CLIGN_D  (1 << 5)
+#define MASK_STOP     (1 << 6)
+#define MASK_KLAXON   (1 << 7)
+#define MASK_D8       (1 << 1)
 
-// Masques pour les broches
-#define MASQUE_SORTIES 0x0F  // Masque pour les 4 bits de sortie (GP0-GP3)
+#define LED_CLIGN_G 11
+#define LED_CLIGN_D 12
+#define LED_STOP    13
+#define LED_KLAXON  14
 
-// =============================================================================
-//                             ETATS DES FEUX
-// =============================================================================
+#define POLLING_INTERVAL  200
+#define BLINK_INTERVAL    500
 
-// Définition des états des feux avec leur nom
+// -------------------- STRUCTURE ET ETAT --------------------
 typedef struct {
-  uint8_t valeur;       // Valeur hexadécimale
-  const char* nom;      // Nom de la lampe
-} EtatFeux;
+  bool clignGauche;
+  bool clignDroit;
+  bool stop;
+  bool klaxon;
+  bool warning;
+  bool ledD8;
+  unsigned long dernierPoll;
+  unsigned long dernierClignotement;
 
-const EtatFeux etatsFeux[] = {
-  {0x01, "Veilleuse"},
-  {0x02, "Code"},
-  {0x04, "Phare"},
-  {0x08, "Clignotant droit"},
-  {0x00, "Feux eteints"}
-};
+  bool prevClignGauche;
+  bool prevClignDroit;
+  bool prevStop;
+  bool prevKlaxon;
 
-const int nbEtats = sizeof(etatsFeux) / sizeof(etatsFeux[0]);
-int indexEtat = 0;              // Index de l'état courant
-unsigned long compteur = 0;     // Compteur pour la temporisation
-bool erreurInit = false;        // Flag d'erreur d'initialisation
+  bool ackPrinted;
+} CommodoState;
 
-// =============================================================================
-//                          FONCTIONS CAN
-// =============================================================================
+CommodoState etat = {false, false, false, false, false, false, 0, 0, false, false, false, false, false};
+bool etatClignotement = false;
 
-/**
- * Envoie une trame CAN et attend l'acquittement
- * 
- * @param registre Adresse du registre à modifier
- * @param masque Masque des bits à modifier
- * @param valeur Valeur à écrire
- * @return true si acquittement reçu, false sinon
- */
-bool envoyerTrameCAN(uint8_t registre, uint8_t masque, uint8_t valeur) {
-  // Préparation de la trame
+// -------------------- AFFICHAGE TRAMES ---------------------
+void afficherTrameTX(const char* label, uint8_t reg, uint8_t mask, uint8_t val) {
+  Serial.print("[TX] "); Serial.print(label);
+  Serial.print(" | Registre: 0x"); Serial.print(reg, HEX);
+  Serial.print(" | Masque: 0x"); Serial.print(mask, HEX);
+  Serial.print(" | Valeur: 0x"); Serial.print(val, HEX);
+  Serial.print(" (0b"); Serial.print(val, BIN); Serial.println(")");
+}
+
+void afficherTrameRX_ACK(uint32_t id, uint8_t reg, uint8_t mask, uint8_t val) {
+  if (!etat.ackPrinted) {
+    Serial.print("[RX] ACK reçu depuis module 0x"); Serial.print(id, HEX);
+    Serial.print(" | Registre: 0x"); Serial.print(reg, HEX);
+    Serial.print(" | Masque: 0x"); Serial.print(mask, HEX);
+    Serial.print(" | Valeur: 0x"); Serial.print(val, HEX);
+    Serial.print(" (0b"); Serial.print(val, BIN); Serial.println(")");
+    etat.ackPrinted = true;
+  }
+}
+
+// ---------------------- CAN SETUP --------------------------
+void initCAN() {
+  SPI.begin();
+  if (mcp2515.reset() != MCP2515::ERROR_OK) while (1);
+  if (mcp2515.setBitrate(CAN_SPEED, CAN_CLOCK) != MCP2515::ERROR_OK) while (1);
+  if (mcp2515.setNormalMode() != MCP2515::ERROR_OK) while (1);
+}
+
+void configurerModule() {
   struct can_frame trame;
-  trame.can_id = ID_IM | CAN_EFF_FLAG;  // Mode étendu (29 bits)
-  trame.can_dlc = 3;                    // 3 octets de données
-  trame.data[0] = registre;             // Octet 0: adresse registre
-  trame.data[1] = masque;               // Octet 1: masque
-  trame.data[2] = valeur;               // Octet 2: valeur
-  
-  // Affichage de la trame envoyée
-  Serial.print(">>> Envoi CAN - ID: 0x");
-  Serial.print(ID_IM, HEX);
-  Serial.print(" | Registre: 0x");
-  Serial.print(registre, HEX);
-  Serial.print(" | Masque: 0x");
-  Serial.print(masque, HEX);
-  Serial.print(" | Valeur: 0x");
-  Serial.println(valeur, HEX);
 
-  // Vider le buffer de réception
-  struct can_frame ack;
-  while (mcp2515.readMessage(&ack) == MCP2515::ERROR_OK);
+  trame.can_id = ID_IM_COMMODO | CAN_EFF_FLAG;
+  trame.can_dlc = 3;
+  trame.data[0] = REG_GPDDR;
+  trame.data[1] = 0xFF;
+  trame.data[2] = 0xFF & ~MASK_D8;
+  mcp2515.sendMessage(&trame);
 
-  // Envoi de la trame
-  if (mcp2515.sendMessage(&trame) != MCP2515::ERROR_OK) {
-    Serial.println("!!! Erreur lors de l'envoi de la trame");
-    return false;
-  }
+  trame.data[0] = REG_GPLAT;
+  trame.data[1] = MASK_D8;
+  trame.data[2] = MASK_D8;
+  mcp2515.sendMessage(&trame);
+}
 
-  // Attente de l'acquittement (200ms max)
-  unsigned long debutAttente = millis();
-  while (millis() - debutAttente < 200) {
-    if (mcp2515.readMessage(&ack) == MCP2515::ERROR_OK) {
-      if ((ack.can_id & 0x1FFFFFFF) == ID_AIM) {
-        Serial.print("<<< Acquittement recu - ID: 0x");
-        Serial.println(ID_AIM, HEX);
-        return true;
-      }
+// --------------------- LOGIQUE CAN -------------------------
+void envoyerCommande(uint8_t mask, bool actif, const char* nom) {
+  struct can_frame trame;
+  trame.can_id = ID_IM_COMMODO | CAN_EFF_FLAG;
+  trame.can_dlc = 3;
+  trame.data[0] = REG_GPLAT;
+  trame.data[1] = mask;
+  trame.data[2] = actif ? 0x00 : mask;
+  mcp2515.sendMessage(&trame);
+  afficherTrameTX(nom, REG_GPLAT, mask, trame.data[2]);
+  etat.ackPrinted = false;
+}
+
+void demanderEtat() {
+  struct can_frame trame;
+  trame.can_id = ID_IRM_COMMODO | CAN_EFF_FLAG;
+  trame.can_dlc = 1;
+  trame.data[0] = REG_GPLAT;
+  mcp2515.sendMessage(&trame);
+  etat.dernierPoll = millis();
+}
+
+bool traiterMessageCAN(can_frame trame) {
+  if ((trame.can_id & 0x1FFFFFFF) == ID_OM_COMMODO && trame.can_dlc >= 2) {
+    bool b1 = !(trame.data[1] & MASK_CLIGN_G);
+    bool b2 = !(trame.data[1] & MASK_CLIGN_D);
+    bool b3 = !(trame.data[1] & MASK_STOP);
+    bool b4 = !(trame.data[1] & MASK_KLAXON);
+
+    etat.warning = b1 && b2;
+
+    if (b1 != etat.prevClignGauche) {
+      envoyerCommande(MASK_CLIGN_G, b1, "CLIGNOTANT G");
+      etat.prevClignGauche = b1;
     }
+    if (b2 != etat.prevClignDroit) {
+      envoyerCommande(MASK_CLIGN_D, b2, "CLIGNOTANT D");
+      etat.prevClignDroit = b2;
+    }
+    if (b3 != etat.prevStop) {
+      envoyerCommande(MASK_STOP, b3, "STOP");
+      etat.prevStop = b3;
+    }
+    if (b4 != etat.prevKlaxon) {
+      envoyerCommande(MASK_KLAXON, b4, "KLAXON");
+      etat.prevKlaxon = b4;
+    }
+
+    etat.clignGauche = b1;
+    etat.clignDroit  = b2;
+    etat.stop        = b3;
+    etat.klaxon      = b4;
+
+    return true;
   }
-  
-  Serial.println("!!! Timeout - Pas d'acquittement recu");
+  else if ((trame.can_id & 0x1FFFFFFF) == ID_AIM_COMMODO) {
+    afficherTrameRX_ACK(ID_AIM_COMMODO, REG_GPLAT, 0xFF, trame.data[2]);
+    return true;
+  }
   return false;
 }
 
-// =============================================================================
-//                     FONCTIONS D'INITIALISATION
-// =============================================================================
-
-/**
- * Initialise la communication CAN
- */
-void initialiserCAN() {
-  Serial.println("Initialisation du module CAN...");
-  
-  SPI.begin();
-  
-  // Réinitialisation du MCP2515
-  if (mcp2515.reset() != MCP2515::ERROR_OK) {
-    Serial.println("!!! Erreur de reset du MCP2515");
-    while (1);
-  }
-  
-  // Configuration du débit (100kbps pour le VMD)
-  if (mcp2515.setBitrate(CAN_100KBPS, MCP_16MHZ) != MCP2515::ERROR_OK) {
-    Serial.println("!!! Erreur de configuration du debit CAN");
-    while (1);
+// ------------------- LOGIQUE LED ET DEBUG ------------------
+void actualiserLEDs() {
+  if (millis() - etat.dernierClignotement > BLINK_INTERVAL) {
+    etatClignotement = !etatClignotement;
+    etat.dernierClignotement = millis();
   }
 
-  // Passage en mode normal
-  mcp2515.setNormalMode();
-  Serial.println("Module CAN initialise avec succes");
+  digitalWrite(LED_CLIGN_G, etat.clignGauche ? etatClignotement : LOW);
+  digitalWrite(LED_CLIGN_D, etat.clignDroit  ? etatClignotement : LOW);
+  digitalWrite(LED_STOP,    etat.stop        ? HIGH : LOW);
+  digitalWrite(LED_KLAXON,  etat.klaxon      ? HIGH : LOW);
 }
 
-/**
- * Configure le module VMD
- */
-void configurerModuleVMD() {
-  Serial.println("\nConfiguration du module VMD...");
-  
-  // Configuration des broches GP0-GP3 en sortie (broches 4-7 en entrée)
-  Serial.println("Configuration des directions des GPIO...");
-  if (!envoyerTrameCAN(REG_GPDDR, 0x7F, 0xF0)) {
-    Serial.println("!!! Erreur de configuration GPDDR");
-    erreurInit = true;
-    return;
-  }
-
-  // Éteindre toutes les lampes initialement
-  Serial.println("Extinction des feux initiaux...");
-  if (!envoyerTrameCAN(REG_GPLAT, MASQUE_SORTIES, 0x00)) {
-    Serial.println("!!! Erreur d'initialisation GPLAT");
-    erreurInit = true;
-    return;
-  }
-
-  Serial.println("Module VMD configure avec succes");
+void afficherEtat() {
+  Serial.println("\n==== ETAT FEUX COMMODO ====");
+  Serial.print("Clignotant Gauche: "); Serial.println(etat.clignGauche ? "ACTIF" : "inactif");
+  Serial.print("Clignotant Droit : "); Serial.println(etat.clignDroit ? "ACTIF" : "inactif");
+  Serial.print("Feu Stop         : "); Serial.println(etat.stop ? "ACTIF" : "inactif");
+  Serial.print("Klaxon           : "); Serial.println(etat.klaxon ? "ACTIF" : "inactif");
+  Serial.print("Warning (Détresse): "); Serial.println(etat.warning ? "ACTIF" : "inactif");
+  Serial.println("===========================");
 }
 
-// =============================================================================
-//                     FONCTIONS DE GESTION DES FEUX
-// =============================================================================
-
-/**
- * Passe à l'état suivant du chenillard
- */
-void changerEtatFeux() {
-  // Passage à l'état suivant
-  indexEtat = (indexEtat + 1) % nbEtats;
-  
-  // Récupération de l'état courant
-  EtatFeux etatCourant = etatsFeux[indexEtat];
-  
-  // Affichage de l'état
-  Serial.print("\n=== Changement d'etat: ");
-  Serial.print(etatCourant.nom);
-  Serial.print(" (0x");
-  Serial.print(etatCourant.valeur, HEX);
-  Serial.println(") ===");
-
-  // Envoi de la commande CAN
-  if (!envoyerTrameCAN(REG_GPLAT, MASQUE_SORTIES, etatCourant.valeur)) {
-    Serial.println("!!! Erreur lors du changement d'etat");
-  }
-}
-
-// =============================================================================
-//                            SETUP & LOOP
-// =============================================================================
-
+// ------------------------ SETUP / LOOP ----------------------
 void setup() {
-  // Initialisation du port série
+  pinMode(LED_CLIGN_G, OUTPUT);
+  pinMode(LED_CLIGN_D, OUTPUT);
+  pinMode(LED_STOP, OUTPUT);
+  pinMode(LED_KLAXON, OUTPUT);
+
   Serial.begin(115200);
-  while (!Serial); // Attendre l'ouverture du port
-  
-  Serial.println("\n=== TP1 - Chenillard VMD avec Arduino ===");
-  Serial.println("=== Systeme de feux avant droit ===");
-  
-  // Initialisations
-  initialiserCAN();
-  configurerModuleVMD();
-  
-  // Vérification de l'initialisation
-  if (erreurInit) {
-    Serial.println("\n!!! Erreur d'initialisation - Systeme bloque !!!");
-  } else {
-    Serial.println("\nSysteme pret - Demarrage du chenillard");
-  }
+  while (!Serial);
+
+  initCAN();
+  configurerModule();
+  demanderEtat();
+  Serial.println("\n[SYSTEME PRÊT]");
 }
 
 void loop() {
-  // Ne rien faire si erreur d'initialisation
-  if (erreurInit) return;
-  
-  // Temporisation basée sur le comptage (comme l'original EID210)
-  compteur++;
-  if (compteur >= 400000) {
-    compteur = 0;
-    changerEtatFeux();
+  struct can_frame trame;
+
+  if (mcp2515.readMessage(&trame) == MCP2515::ERROR_OK) {
+    if (traiterMessageCAN(trame)) {
+      afficherEtat();
+    }
   }
+
+  if (millis() - etat.dernierPoll >= POLLING_INTERVAL) {
+    demanderEtat();
+  }
+
+  actualiserLEDs();
 }
