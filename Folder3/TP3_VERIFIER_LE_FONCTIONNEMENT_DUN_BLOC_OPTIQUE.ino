@@ -12,7 +12,7 @@
 // ============================================================================
 
 // === Bloc cible à modifier facilement ici ===
-#define NOM_BLOC      "FVD"           // Nom pour affichage (ex: "FVD", "FVG", "ARD")
+#define NOM_BLOC      "FVG"           // Nom pour affichage (ex: "FVD", "FVG", "ARD")
 #define ID_IM_BLOC    0x0E080000      // ID de trame IM (Input Message) {Rx}
 #define ID_AIM_BLOC   0x0E200000      // ID de trame AIM (Ack Input Message) {TX}
 
