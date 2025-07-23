@@ -1,225 +1,166 @@
-// ============================================================
-// TP2 - ACQUISITION ETAT COMMODO FEUX VIA CAN BUS
-// ============================================================
+// =============================================================
+// TP2 - Acquisition de l’état des feux via le commodo CAN
+// Objectif : Lire les entrées du module (GP0 à GP7), afficher les feux actifs et l'état d commodo,
+// Envoyer une trame de commande combinée (logique TOR + addition de bits).
+// =============================================================
 
 #include <SPI.h>
 #include <mcp2515.h>
 
-// -------------------- CONFIGURATION ------------------------
-const int SPI_CS_PIN = 9;
+// ======================= PARAMÈTRES CAN ==========================
+const int SPI_CS_PIN = 9;                  // CS du module MCP2515
 MCP2515 mcp2515(SPI_CS_PIN);
 
-#define CAN_SPEED CAN_100KBPS
-#define CAN_CLOCK MCP_16MHZ
+#define CAN_SPEED  CAN_100KBPS
+#define CAN_CLOCK  MCP_16MHZ
 
-#define ID_IM_COMMODO   0x05081F00
-#define ID_AIM_COMMODO  0x05200000
-#define ID_IRM_COMMODO  0x05041E07
-#define ID_OM_COMMODO   0x05400000
+// ID étendus pour la communication avec le module CAN01A (MCP25050)
+#define ID_IM_COMMODO   0x05081F00  // Instruction maître
+#define ID_AIM_COMMODO  0x05200000  // Accusé de réception (ACK)
+#define ID_IRM_COMMODO  0x05041E07  // Instruction de lecture
+#define ID_OM_COMMODO   0x05400000  // Observation maître (retour d’état)
 
-#define REG_GPDDR  0x1F
-#define REG_GPLAT  0x1E
-#define REG_IOTEN  0x1C
+#define REG_GPDDR  0x1F  // Direction des broches
+#define REG_GPLAT  0x1E  // Valeur des sorties
+#define REG_IOTEN  0x1C  // Activation I/O (inutile ici)
 
-#define MASK_CLIGN_G  (1 << 4)
-#define MASK_CLIGN_D  (1 << 5)
-#define MASK_STOP     (1 << 6)
-#define MASK_KLAXON   (1 << 7)
-#define MASK_D8       (1 << 1)
+// Masques associés aux broches GP0 à GP7 du module CAN
+#define MASK_VEILLEUSE  (1 << 0)  // GP0 = 0x01
+#define MASK_WARNING    (1 << 1)  // GP1 = 0x02
+#define MASK_PHARE      (1 << 2)  // GP2 = 0x04
+#define MASK_CODE       (1 << 3)  // GP3 = 0x08
+#define MASK_CLIGN_G    (1 << 4)  // GP4 = 0x10
+#define MASK_CLIGN_D    (1 << 5)  // GP5 = 0x20
+#define MASK_STOP       (1 << 6)  // GP6 = 0x40
+#define MASK_KLAXON     (1 << 7)  // GP7 = 0x80
 
-#define LED_CLIGN_G 11
-#define LED_CLIGN_D 12
-#define LED_STOP    13
-#define LED_KLAXON  14
+#define POLLING_INTERVAL 50       // Délai entre chaque requête IRM (ms)
 
-#define POLLING_INTERVAL  50
-#define BLINK_INTERVAL    500
+// ======================= VARIABLES GLOBALES =======================
+uint8_t dernierEtatBoutons = 0;    // Dernier état connu (pour éviter les doublons)
+unsigned long dernierPoll = 0;     // Timestamp de la dernière requête IRM
+bool ackPrinted = false;           // Évite de réafficher le même ACK
+bool ackPending = false;           // Attente d’un ACK après envoi d’une commande
 
-// -------------------- STRUCTURE ET ETAT --------------------
-typedef struct {
-  bool clignGauche;
-  bool clignDroit;
-  bool stop;
-  bool klaxon;
-  bool warning;
-  bool ledD8;
-  unsigned long dernierPoll;
-  unsigned long dernierClignotement;
-
-  bool prevClignGauche;
-  bool prevClignDroit;
-  bool prevStop;
-  bool prevKlaxon;
-
-  bool ackPrinted;
-} CommodoState;
-
-CommodoState etat = {false, false, false, false, false, false, 0, 0, false, false, false, false, false};
-bool etatClignotement = false;
-bool changementEtat = false;
-
-// -------------------- AFFICHAGE TRAMES ---------------------
-void afficherTrameTX(const char* label, uint8_t reg, uint8_t mask, uint8_t val) {
-  Serial.print("[TX] "); Serial.print(label);
-  Serial.print(" | Registre: 0x"); Serial.print(reg, HEX);
-  Serial.print(" | Masque: 0x"); Serial.print(mask, HEX);
-  Serial.print(" | Valeur: 0x"); Serial.print(val, HEX);
-  Serial.print(" (0b"); Serial.print(val, BIN); Serial.println(")");
-}
-
-void afficherTrameRX_ACK(uint32_t id, uint8_t reg, uint8_t mask, uint8_t val) {
-  if (!etat.ackPrinted) {
-    Serial.print("[RX] ACK reçu depuis module 0x"); Serial.print(id, HEX);
-    Serial.print(" | Registre: 0x"); Serial.print(reg, HEX);
-    Serial.print(" | Masque: 0x"); Serial.print(mask, HEX);
-    Serial.print(" | Valeur: 0x"); Serial.print(val, HEX);
-    Serial.print(" (0b"); Serial.print(val, BIN); Serial.println(")");
-    etat.ackPrinted = true;
-  }
-}
-
-// ---------------------- CAN SETUP --------------------------
+// ======================== INITIALISATION CAN ========================
 void initCAN() {
   SPI.begin();
-  if (mcp2515.reset() != MCP2515::ERROR_OK) while (1);
-  if (mcp2515.setBitrate(CAN_SPEED, CAN_CLOCK) != MCP2515::ERROR_OK) while (1);
-  if (mcp2515.setNormalMode() != MCP2515::ERROR_OK) while (1);
+  while (mcp2515.reset()           != MCP2515::ERROR_OK);
+  while (mcp2515.setBitrate(CAN_SPEED, CAN_CLOCK) != MCP2515::ERROR_OK);
+  while (mcp2515.setNormalMode()   != MCP2515::ERROR_OK);
 }
 
+// Configuration du module en entrée (tous les GP en entrée)
 void configurerModule() {
   struct can_frame trame;
-
-  trame.can_id = ID_IM_COMMODO | CAN_EFF_FLAG;
+  trame.can_id  = ID_IM_COMMODO | CAN_EFF_FLAG;
   trame.can_dlc = 3;
-  trame.data[0] = REG_GPDDR;
-  trame.data[1] = 0xFF;
-  trame.data[2] = 0xFF & ~MASK_D8;
-  mcp2515.sendMessage(&trame);
-
-  trame.data[0] = REG_GPLAT;
-  trame.data[1] = MASK_D8;
-  trame.data[2] = MASK_D8;
+  trame.data[0] = REG_GPDDR;   // Direction
+  trame.data[1] = 0xFF;        // Masque complet
+  trame.data[2] = 0xFF;        // Tous en entrée
   mcp2515.sendMessage(&trame);
 }
 
-// --------------------- LOGIQUE CAN -------------------------
-void envoyerCommande(uint8_t mask, bool actif, const char* nom) {
+// ======================= AFFICHAGE ET ENVOI =========================
+
+// Affiche l’état de chaque feu dans un format lisible
+void afficherEtatFeux(uint8_t boutons) {
+  Serial.println("\n==== ETAT FEUX COMMODO ====");
+  Serial.print("Clignotant Gauche: "); Serial.println(boutons & MASK_CLIGN_G    ? "ACTIF" : "inactif");
+  Serial.print("Clignotant Droit : "); Serial.println(boutons & MASK_CLIGN_D    ? "ACTIF" : "inactif");
+  Serial.print("Stop             : "); Serial.println(boutons & MASK_STOP       ? "ACTIF" : "inactif");
+  Serial.print("Klaxon           : "); Serial.println(boutons & MASK_KLAXON     ? "ACTIF" : "inactif");
+  Serial.print("Veilleuse        : "); Serial.println(boutons & MASK_VEILLEUSE  ? "ACTIF" : "inactif");
+  Serial.print("Phare            : "); Serial.println(boutons & MASK_PHARE      ? "ACTIF" : "inactif");
+  Serial.print("Code             : "); Serial.println(boutons & MASK_CODE       ? "ACTIF" : "inactif");
+  Serial.print("Warning          : "); Serial.println(boutons & MASK_WARNING    ? "ACTIF" : "inactif");
+  Serial.println("===========================\n");
+}
+
+// Envoie la commande combinée (logique TOR) vers le module
+void envoyerCommande(uint8_t valeur) {
   struct can_frame trame;
-  trame.can_id = ID_IM_COMMODO | CAN_EFF_FLAG;
+  trame.can_id  = ID_IM_COMMODO | CAN_EFF_FLAG;
   trame.can_dlc = 3;
-  trame.data[0] = REG_GPLAT;
-  trame.data[1] = mask;
-  trame.data[2] = actif ? mask : 0x00;
+  trame.data[0] = REG_GPLAT;    // Écriture de l’état
+  trame.data[1] = 0xFF;         // Masque complet
+  trame.data[2] = valeur;       // Valeur à activer (ex: 0xC0 pour stop+klaxon)
+
   mcp2515.sendMessage(&trame);
-  afficherTrameTX(nom, REG_GPLAT, mask, trame.data[2]);
-  etat.ackPrinted = false;
+
+  Serial.print("[TX] Feux actifs : 0x"); Serial.print(valeur, HEX);
+  Serial.print(" (0b"); Serial.print(valeur, BIN); Serial.println(")");
+
+  ackPrinted = false;
+  ackPending = true;
 }
 
+// Demande l’état actuel des entrées du module (via trame IRM)
 void demanderEtat() {
   struct can_frame trame;
-  trame.can_id = ID_IRM_COMMODO | CAN_EFF_FLAG;
+  trame.can_id  = ID_IRM_COMMODO | CAN_EFF_FLAG;
   trame.can_dlc = 1;
-  trame.data[0] = REG_GPLAT;
+  trame.data[0] = REG_GPLAT;  // Lecture de l’état des sorties
   mcp2515.sendMessage(&trame);
-  etat.dernierPoll = millis();
+  dernierPoll = millis();
 }
 
-bool traiterMessageCAN(can_frame trame) {
-  if ((trame.can_id & 0x1FFFFFFF) == ID_OM_COMMODO && trame.can_dlc >= 2) {
-    bool b1 = !(trame.data[1] & MASK_CLIGN_G);
-    bool b2 = !(trame.data[1] & MASK_CLIGN_D);
-    bool b3 = !(trame.data[1] & MASK_STOP);
-    bool b4 = !(trame.data[1] & MASK_KLAXON);
+// ====================== TRAITEMENT DES TRAMES ========================
 
-    etat.warning = b1 && b2;
+void traiterMessageCAN(can_frame trame) {
+  uint32_t id = trame.can_id & 0x1FFFFFFF;
 
-    if (b1 != etat.prevClignGauche) {
-      envoyerCommande(MASK_CLIGN_G, b1, "CLIGNOTANT G");
-      etat.prevClignGauche = b1;
-      changementEtat = true;
+  // Trame de retour d’état (OM)
+  if (id == ID_OM_COMMODO && trame.can_dlc >= 2) {
+    uint8_t boutons = ~trame.data[1]; // Inversion logique : appui = 1
+
+    // Changement d’état détecté
+    if (boutons != dernierEtatBoutons) {
+      dernierEtatBoutons = boutons;
+      envoyerCommande(boutons);    // Envoi des feux actifs combinés
+      afficherEtatFeux(boutons);   // Affichage détaillé
     }
-    if (b2 != etat.prevClignDroit) {
-      envoyerCommande(MASK_CLIGN_D, b2, "CLIGNOTANT D");
-      etat.prevClignDroit = b2;
-      changementEtat = true;
-    }
-    if (b3 != etat.prevStop) {
-      envoyerCommande(MASK_STOP, b3, "STOP");
-      etat.prevStop = b3;
-      changementEtat = true;
-    }
-    if (b4 != etat.prevKlaxon) {
-      envoyerCommande(MASK_KLAXON, b4, "KLAXON");
-      etat.prevKlaxon = b4;
-      changementEtat = true;
-    }
-
-    etat.clignGauche = b1;
-    etat.clignDroit  = b2;
-    etat.stop        = b3;
-    etat.klaxon      = b4;
-
-    return true;
-  }
-  else if ((trame.can_id & 0x1FFFFFFF) == ID_AIM_COMMODO) {
-    afficherTrameRX_ACK(ID_AIM_COMMODO, REG_GPLAT, 0xFF, trame.data[2]);
-    return true;
-  }
-  return false;
-}
-
-// ------------------- LOGIQUE LED ET DEBUG ------------------
-void actualiserLEDs() {
-  if (millis() - etat.dernierClignotement > BLINK_INTERVAL) {
-    etatClignotement = !etatClignotement;
-    etat.dernierClignotement = millis();
   }
 
-  digitalWrite(LED_CLIGN_G, etat.clignGauche ? etatClignotement : LOW);
-  digitalWrite(LED_CLIGN_D, etat.clignDroit  ? etatClignotement : LOW);
-  digitalWrite(LED_STOP,    etat.stop        ? HIGH : LOW);
-  digitalWrite(LED_KLAXON,  etat.klaxon      ? HIGH : LOW);
+  // Trame d’ACK (AIM)
+  else if (id == ID_AIM_COMMODO && ackPending && !ackPrinted) {
+    Serial.print("[RX] ACK depuis 0x"); Serial.print(ID_AIM_COMMODO, HEX);
+    Serial.print(" : 0x"); Serial.print(trame.data[2], HEX);
+    Serial.print(" (0b"); Serial.print(trame.data[2], BIN); Serial.println(")");
+
+    ackPrinted  = true;
+    ackPending  = false;
+  }
 }
 
-void afficherEtat() {
-  Serial.println("\n==== ETAT FEUX COMMODO ====");
-  Serial.print("Clignotant Gauche : "); Serial.println(etat.clignGauche ? "ACTIF" : "inactif");
-  Serial.print("Clignotant Droit   : "); Serial.println(etat.clignDroit ? "ACTIF" : "inactif");
-  Serial.print("Feu Stop           : "); Serial.println(etat.stop ? "ACTIF" : "inactif");
-  Serial.print("Klaxon             : "); Serial.println(etat.klaxon ? "ACTIF" : "inactif");
-  Serial.print("Warning (Détresse) : "); Serial.println(etat.warning ? "ACTIF" : "inactif");
-  Serial.println("===========================");
+// Boucle de gestion du CAN (lecture et polling)
+void loopCAN() {
+  struct can_frame trame;
+
+  // Lecture d’un message reçu
+  if (mcp2515.readMessage(&trame) == MCP2515::ERROR_OK) {
+    traiterMessageCAN(trame);
+  }
+
+  // Requête périodique d’état toutes les 50 ms
+  if (millis() - dernierPoll >= POLLING_INTERVAL) {
+    demanderEtat();
+  }
 }
 
-// ------------------------ SETUP / LOOP ----------------------
+// ============================== SETUP / LOOP ===============================
+
 void setup() {
-  pinMode(LED_CLIGN_G, OUTPUT);
-  pinMode(LED_CLIGN_D, OUTPUT);
-  pinMode(LED_STOP, OUTPUT);
-  pinMode(LED_KLAXON, OUTPUT);
-
   Serial.begin(115200);
-  while (!Serial);
+  while (!Serial);              // Attente ouverture moniteur série
 
-  initCAN();
-  configurerModule();
-  demanderEtat();
-  Serial.println("\n[SYSTEME PRÊT]");
+  initCAN();                    // Initialisation du bus CAN
+  configurerModule();           // Tous les GP en entrée
+  demanderEtat();               // Première requête d’état
+
+  Serial.println("\n[SYSTEME PRÊT - MODE TOR + COMBINAISON]");
 }
 
 void loop() {
-  struct can_frame trame;
-
-  if (mcp2515.readMessage(&trame) == MCP2515::ERROR_OK) {
-    if (traiterMessageCAN(trame) && changementEtat) {
-      afficherEtat();
-      changementEtat = false;
-    }
-  }
-
-  if (millis() - etat.dernierPoll >= POLLING_INTERVAL) {
-    demanderEtat();
-  }
-
-  actualiserLEDs();
+  loopCAN();                    // Gestion continue du bus CAN
 }
