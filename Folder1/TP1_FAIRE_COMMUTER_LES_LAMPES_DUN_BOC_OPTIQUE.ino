@@ -1,203 +1,255 @@
-/*******************************************************************************
- *  TP1 - Chenillard VMD avec Arduino Uno R3 et MCP2515
- *  
- *  Description: 
- *    Ce programme implémente un chenillard sur les feux avant droit d'un véhicule
- *    didactique utilisant le bus CAN. Il suit les spécifications du TP1 du manuel
- *    VMD.
- *  
- *  Fonctionnement:
- *    - Séquence cyclique: Veilleuse -> Code -> Phare -> Clignotant droit -> Eteint
- *    - Communication CAN avec le module MCP25050
- *    - Affichage détaillé sur le moniteur série
- *  
- *  Modules compatibles : Feux avant droit (par défaut), modifiable pour
- *                       Feux avant gauche, arrière droit ou arrière gauche.
-
- *******************************************************************************/
+/**************************************************************************
+ * TP1 - Chenillard VMD (Arduino Uno R3 + MCP2515)
+ * ------------------------------------------------------------------------
+ * Objectif : Commander cycliquement les feux via le bus CAN.
+ * Séquence : Veilleuse → Code → Phare → Clignotant → Éteint → ... (avant)
+ *            Veilleuse → Clignotant → Stop → Klaxon/Libre → Éteint → ... (arrière)
+ **************************************************************************/
 
 #include <SPI.h>
 #include "mcp2515.h"
 
-// ============================================================================
-// === CONFIGURATION MATÉRIELLE ==============================================
-// ============================================================================
+// ----------------- CONFIGURATION MATÉRIELLE -----------
 
-const int SPI_CS_PIN = 9;              // Broche CS reliée au MCP2515
-MCP2515 mcp2515(SPI_CS_PIN);           // Objet pour contrôler le MCP2515
+const int SPI_CS_PIN = 9;              // Broche CS du MCP2515
+MCP2515 mcp2515(SPI_CS_PIN);           // Contrôleur CAN
 
-// ============================================================================
-// === PARAMÈTRES CAN & REGISTRES MCP25050 ===================================
-// ============================================================================
+// ------------- CONFIGURATION DES MODULES --------------
 
-#define ID_IM   0x0E080000              // ID de trame IM pour le module (par défaut : feux avant droit) {RX}
-#define ID_AIM  0x0E200000              // ID de trame AIM (acquittement) {TX}
-#define REG_GPDDR 0x1F                  // Registre : direction des ports
-#define REG_GPLAT 0x1E                  // Registre : sortie des ports
-#define MASQUE_SORTIES 0x0F             // GP0 à GP3 en sortie (bits actifs)
+// Décommenter UN SEUL module à contrôler :
+#define MODULE_AVANT_DROIT
+//#define MODULE_AVANT_GAUCHE
+//#define MODULE_ARRIERE_DROIT
+//#define MODULE_ARRIERE_GAUCHE
 
-// Pour utiliser d'autres modules VMD (changer ID_IM et ID_AIM si besoin) :
-//  Avant droit   : RX=0x0E880000 TX=0x0EA00000
-//  Avant gauche  : RX=0x0E080000 TX=0x0E200000
-//  Arrière droit : RX=0x0F880000 TX=0x0FA00000
-//  Arrière gauche: RX=0x0F080000 TX=0x0F200000
+// Structure de configuration CAN
+struct ModuleConfig {
+  const char* nom;    // Nom descriptif
+  uint32_t id_im;    // ID pour Input Message (RXF1)
+  uint32_t id_aim;  // ID pour Acquittement (TXD1)
+  bool is_avant;   // True si module avant, false si arrière
+};
 
-// ============================================================================
-// === SÉQUENCE DES FEUX =====================================================
-// ============================================================================
+// Tableau de configurations pour tous les modules
+const ModuleConfig modules[] = {
+  {"Feux avant droit",   0x0E880000, 0x0EA00000, true},
+  {"Feux avant gauche",  0x0E080000, 0x0E200000, true},
+  {"Feux arrière droit", 0x0F880000, 0x0FA00000, false},
+  {"Feux arrière gauche",0x0F080000, 0x0F200000, false}
+};
+
+// Sélection du module actif
+#if defined(MODULE_AVANT_DROIT)
+  #define MODULE_INDEX 0
+#elif defined(MODULE_AVANT_GAUCHE)
+  #define MODULE_INDEX 1
+#elif defined(MODULE_ARRIERE_DROIT)
+  #define MODULE_INDEX 2
+#elif defined(MODULE_ARRIERE_GAUCHE)
+  #define MODULE_INDEX 3
+#else
+  #error "Aucun module sélectionné!"
+#endif
+
+const ModuleConfig& module = modules[MODULE_INDEX]; // Référence au module actif
+
+// Registres MCP25050
+#define REG_GPDDR 0x1F        // Configuration des ports (GP0-GP7)
+#define REG_GPLAT 0x1E        // État des sorties
+#define MASQUE_SORTIES 0x0F   // Masque pour les 4 bits de poids faible (GP0-GP3)
+
+// ------------ DÉFINITION DES SÉQUENCES DE FEUX --------------
 
 struct EtatFeu {
-  uint8_t valeur;           // Valeur hexadécimale à écrire sur GPLAT
-  const char* nom;          // Nom descriptif pour affichage
+  uint8_t valeur;           // Valeur à écrire dans GPLAT
+  const char* description;  // Description lisible
 };
 
-const EtatFeu chenillard[] = {
-  {0x01, "Veilleuse"},
-  {0x02, "Code"},
-  {0x04, "Phare"},
-  {0x08, "Clignotant"},
-  {0x00, "Éteint"}
+// Séquences prédéfinies pour les modules avant
+const EtatFeu sequenceAvant[] = {
+  {0x01, "Veilleuse (GP0)"},
+  {0x02, "Code (GP1)"}, 
+  {0x04, "Phare (GP2)"},
+  {0x08, "Clignotant (GP3)"},
+  {0x00, "Tous éteints"}
 };
 
-const int NB_ETATS = sizeof(chenillard) / sizeof(EtatFeu);
-int indexEtat = 0;                     // Indice dans le tableau de séquence
+// Séquence pour le module arrière gauche
+const EtatFeu chenillardArriereGauche[] = {
+  {0x08, "Veilleuse (GP0)"},        // GP0 (0x08)
+  {0x04, "Clignotant (GP1)"},      // GP1 (0x04)
+  {0x02, "Stop (GP2)"},           // GP2 (0x02)
+  {0x01, "Klaxon (GP3)"},        // GP3 (0x01)
+  {0x00, "Tous éteints"}
+};
 
-// ============================================================================
-// === GESTION TEMPS DE CYCLE ================================================
-// ============================================================================
+// Séquence pour le module arrière droit
+const EtatFeu chenillardArriereDroit[] = {
+  {0x08, "Veilleuse (GP0)"},       // GP0 (0x08)
+  {0x04, "Clignotant (GP1)"},     // GP1 (0x04)
+  {0x02, "Stop (GP2)"},          // GP2 (0x02)
+  {0x01, "Libre (GP3)"},        // GP3 (0x01)
+  {0x00, "Tous éteints"}
+};
 
-const unsigned long DELAI_CYCLE = 1200; // Délai entre deux états (en ms)
-unsigned long tDernierCycle = 0;        // Dernier passage de cycle
+// Pointeurs vers la séquence active et gestion d'état
+const EtatFeu* sequenceActive;
+uint8_t nbEtats;
+uint8_t etatActuel = 0;
 
-// ============================================================================
-// === INITIALISATION DU BUS CAN =============================================
-// ============================================================================
+// ----------- GESTION DU TEMPS -------------
 
-bool erreurInit = false;               // Flag d'erreur de démarrage
+const unsigned long INTERVALLE_CHANGEMENT = 1000; // Intervalle entre états (ms)
+unsigned long dernierChangement = 0;             // Dernier changement d'état
 
-void initialiserCAN() {
+// ------------ FONCTIONS CAN --------------
+
+/**
+ * Initialise le contrôleur CAN
+ * @return true si succès, false sinon
+ */
+bool initialiserCAN() {
   SPI.begin();
-
+  
   if (mcp2515.reset() != MCP2515::ERROR_OK) {
-    Serial.println(" Erreur reset MCP2515");
-    erreurInit = true;
-    return;
-  }
-
-  if (mcp2515.setBitrate(CAN_100KBPS, MCP_16MHZ) != MCP2515::ERROR_OK) {
-    Serial.println(" Erreur configuration CAN à 100 kbps");
-    erreurInit = true;
-    return;
-  }
-
-  mcp2515.setNormalMode();
-  Serial.println("✅ Bus CAN initialisé en mode normal");
-}
-
-// ============================================================================
-// === CONFIGURATION DU MODULE VMD (MCP25050) ================================
-// ============================================================================
-
-void configurerModuleVMD() {
-  Serial.println("  Configuration du module VMD...");
-
-  // Mettre GP0 à GP3 en sortie, GP4 à GP7 en entrée → valeur = 0xF0
-  if (!envoyerTrameCAN(REG_GPDDR, 0x7F, 0xF0)) {
-    Serial.println(" Échec configuration GPDDR");
-    erreurInit = true;
-    return;
-  }
-
-  // Forcer les sorties à 0 (tous les feux éteints)
-  if (!envoyerTrameCAN(REG_GPLAT, MASQUE_SORTIES, 0x00)) {
-    Serial.println(" Échec initialisation feux");
-    erreurInit = true;
-    return;
-  }
-
-  Serial.println(" Module VMD prêt à l'emploi");
-}
-
-// ============================================================================
-// === ENVOI D’UNE TRAME CAN AVEC ATTENTE ACQUITTEMENT ========================
-// ============================================================================
-
-bool envoyerTrameCAN(uint8_t registre, uint8_t masque, uint8_t valeur) {
-  struct can_frame trame;
-  trame.can_id = ID_IM | CAN_EFF_FLAG;
-  trame.can_dlc = 3;
-  trame.data[0] = registre;   // Registre cible (ex: GPLAT)
-  trame.data[1] = masque;     // Masque des bits modifiés
-  trame.data[2] = valeur;     // Valeur à écrire
-
-  // Vider le buffer CAN pour éviter de lire une ancienne trame AIM
-  struct can_frame ack;
-  while (mcp2515.readMessage(&ack) == MCP2515::ERROR_OK);
-
-  // Envoi de la trame
-  if (mcp2515.sendMessage(&trame) != MCP2515::ERROR_OK) {
-    Serial.println(" Erreur d'envoi CAN");
+    Serial.println("[ERREUR] Échec reset MCP2515");
     return false;
   }
 
-  // Attente d'acquittement pendant 200 ms
-  unsigned long t0 = millis();
-  while (millis() - t0 < 200) {
-    if (mcp2515.readMessage(&ack) == MCP2515::ERROR_OK) {
-      if ((ack.can_id & 0x1FFFFFFF) == ID_AIM) {
-        Serial.println("✅ Acquittement AIM reçu");
+  if (mcp2515.setBitrate(CAN_100KBPS, MCP_16MHZ) != MCP2515::ERROR_OK) {
+    Serial.println("[ERREUR] Configuration bitrate CAN");
+    return false;
+  }
+
+  mcp2515.setNormalMode();
+  Serial.print("[CAN] Prêt (100 kbps) - Module: ");
+  Serial.println(module.nom);
+  return true;
+}
+
+/**
+ * Envoie une commande au module VMD et vérifie l'acquittement
+ * @param registre Registre cible (GPDDR/GPLAT)
+ * @param masque Bits à modifier
+ * @param valeur Valeur à écrire
+ * @return true si succès, false sinon
+ */
+bool envoyerCommande(uint8_t registre, uint8_t masque, uint8_t valeur) {
+  struct can_frame trame;
+  
+  // Configuration de la trame CAN
+  trame.can_id = module.id_im | CAN_EFF_FLAG; // Mode étendu
+  trame.can_dlc = 3;                         // 3 octets de données
+  trame.data[0] = registre;
+  trame.data[1] = masque;
+  trame.data[2] = valeur;
+
+  // Debug: affichage des détails de la trame
+  Serial.print("[ENVOI] [RXF1]: 0x");
+  Serial.print(module.id_im, HEX);
+  Serial.print(" | Registre: 0x");
+  Serial.print(registre, HEX);
+  Serial.print(" | Masque: 0x");
+  Serial.print(masque, HEX);
+  Serial.print(" | Valeur: 0x");
+  Serial.println(valeur, HEX);
+
+  // Purge du buffer CAN avant envoi
+  struct can_frame trameRecue;
+  while (mcp2515.readMessage(&trameRecue) == MCP2515::ERROR_OK);
+
+  // Envoi de la trame
+  if (mcp2515.sendMessage(&trame) != MCP2515::ERROR_OK) {
+    Serial.println("[ERREUR] Échec envoi CAN");
+    return false;
+  }
+
+  // Attente acquittement (200ms timeout)
+  unsigned long debutAttente = millis();
+  while (millis() - debutAttente < 200) {
+    if (mcp2515.readMessage(&trameRecue) == MCP2515::ERROR_OK) {
+      if ((trameRecue.can_id & 0x1FFFFFFF) == module.id_aim) {
+        Serial.print("[RECEPTION] [TXD1] Acquittement reçu - ID: 0x");
+        Serial.println(module.id_aim, HEX);
         return true;
       }
     }
   }
 
-  Serial.println(" Timeout : pas d'acquittement reçu");
+  Serial.println("[ERREUR] Timeout acquittement");
   return false;
 }
 
-// ============================================================================
-// === SETUP INITIAL ==========================================================
-// ============================================================================
+/**
+ * Configure les ports du module VMD
+ * @return true si succès, false sinon
+ */
+bool configurerModule() {
+  Serial.println("\n[CONFIG] Initialisation module...");
+  
+  // Configuration des ports (GP0-3 en sortie)
+  if (!envoyerCommande(REG_GPDDR, 0x7F, 0xF0)) {
+    Serial.println("[ERREUR] Configuration GPDDR");
+    return false;
+  }
+
+  // Initialisation: toutes les sorties éteintes
+  if (!envoyerCommande(REG_GPLAT, MASQUE_SORTIES, 0x00)) {
+    Serial.println("[ERREUR] Initialisation GPLAT");
+    return false;
+  }
+
+  Serial.println("[CONFIG] Module prêt");
+  return true;
+}
+
+// ------------ SETUP ---------------
 
 void setup() {
   Serial.begin(115200);
-  while (!Serial);  // Attente de l’ouverture du moniteur série
+  while (!Serial); // Pour les cartes avec USB natif
 
-  Serial.println("\n========== TP1 - Chenillard VMD ==========");
-  Serial.println("Module cible : Feux avant droit (ID: 0x0E880000)");
-  Serial.println("===========================================\n");
+  // Sélection de la séquence appropriée
+  if (module.is_avant) {
+    sequenceActive = sequenceAvant;
+    nbEtats = sizeof(sequenceAvant) / sizeof(EtatFeu);
+  } else {
+    #if defined(MODULE_ARRIERE_GAUCHE)
+      sequenceActive = chenillardArriereGauche;
+      nbEtats = sizeof(chenillardArriereGauche) / sizeof(EtatFeu);
+    #elif defined(MODULE_ARRIERE_DROIT)
+      sequenceActive = chenillardArriereDroit;
+      nbEtats = sizeof(chenillardArriereDroit) / sizeof(EtatFeu);
+    #endif
+  }
 
-  initialiserCAN();
-  if (!erreurInit) configurerModuleVMD();
+  // Initialisation CAN
+  if (!initialiserCAN() || !configurerModule()) {
+    Serial.println("\n[ARRÊT] Erreur critique - Vérifiez le câblage");
+    while (1); // Blocage
+  }
 
-  if (erreurInit) Serial.println("\n Système bloqué suite à une erreur !");
-  else Serial.println("\n Chenillard démarré !\n");
+  Serial.println("\n[SYSTÈME] Prêt\n");
 }
 
-// ============================================================================
-// === BOUCLE PRINCIPALE ======================================================
-// ============================================================================
+// -------- BOUCLE PRINCIPALE ----------
 
 void loop() {
-  if (erreurInit) return;
+  // Gestion du changement d'état périodique
+  if (millis() - dernierChangement >= INTERVALLE_CHANGEMENT) {
+    dernierChangement = millis();
 
-  // Avancer dans le chenillard après DELAI_CYCLE ms
-  if (millis() - tDernierCycle >= DELAI_CYCLE) {
-    tDernierCycle = millis();
+    // Passage à l'état suivant
+    etatActuel = (etatActuel + 1) % nbEtats;
+    const EtatFeu& etat = sequenceActive[etatActuel];
 
-    // Passer à l’état suivant
-    indexEtat = (indexEtat + 1) % NB_ETATS;
-    const EtatFeu& etat = chenillard[indexEtat];
-
-    Serial.print("\n🔁 Nouvel état : ");
-    Serial.print(etat.nom);
-    Serial.print(" (0x");
-    Serial.print(etat.valeur, HEX);
-    Serial.println(")");
-
-    // Envoi de la trame vers le VMD
-    if (!envoyerTrameCAN(REG_GPLAT, MASQUE_SORTIES, etat.valeur)) {
-      Serial.println(" Erreur d'envoi de la trame GPLAT");
+    // Affichage et envoi
+    Serial.print("\n Changement état⬇️:\n ");
+    Serial.println(etat.description);;
+    
+    
+    if (!envoyerCommande(REG_GPLAT, MASQUE_SORTIES, etat.valeur)) {
+      Serial.println("[ERREUR] Échec commande feux");
     }
   }
 }
