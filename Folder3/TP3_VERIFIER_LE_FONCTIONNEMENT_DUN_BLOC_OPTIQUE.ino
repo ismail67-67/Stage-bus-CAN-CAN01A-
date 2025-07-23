@@ -1,28 +1,45 @@
-// ============================================================================
-// TP3 - Contrôle des feux avant droit (FVD) via CAN
-// Arduino Uno + MCP2515 - Véhicule Multiplexé Didactique
-// ============================================================================
+/*******************************************************************************
+* TP3 – Contrôle des feux d’un bloc optique via CAN (VMD - MCP2515)
+* Séquence : Clignotant droit independent des feux chaque 1.6s → Veilleuse → Veilleuse+Code → Veilleuse+Phare → Eteint → ...
+* Arduino Uno R3 + MCP2515 – Feux Avant Droit (modifiable)
+ ******************************************************************************/
+
 #include <SPI.h>
 #include <mcp2515.h>
 
-const int SPI_CS_PIN = 9;
+// ============================================================================
+    // CONFIGURATION PRINCIPALE
+// ============================================================================
+
+// === Bloc cible à modifier facilement ici ===
+#define NOM_BLOC      "FVD"           // Nom pour affichage (ex: "FVD", "FVG", "ARD")
+#define ID_IM_BLOC    0x0E080000      // ID de trame IM (Input Message) {Rx}
+#define ID_AIM_BLOC   0x0E200000      // ID de trame AIM (Ack Input Message) {TX}
+
+// Pour utiliser d'autres modules VMD (changer ID_IM et ID_AIM si besoin) :
+//  Avant gauche  : RX=0x0E080000 TX=0x0E200000
+//  Avant droite  : RX=0x0E880000 TX=0x0EA00000
+
+// === CAN ===
+#define SPI_CS_PIN    9
+#define CAN_SPEED     CAN_100KBPS
+#define CAN_CLOCK     MCP_16MHZ
+
+// === Registres GPIO du MCP25050 ===
+#define REG_GPDDR     0x1F            // Direction des GPIO
+#define REG_GPLAT     0x1E            // État des GPIO
+#define MASK_BLOC     0x0F            // Masque pour bits 0–3
+
+// === Temps (en ms) ===
+#define TEMPO_FEUX     3500           // 3.5 s entre chaque étape des feux
+#define TEMPO_CLIGNOT  1600           // 1.6 s pour le clignotement
+
+// ============================================================================
+    // VARIABLES GLOBALES
+// ============================================================================
+
 MCP2515 mcp2515(SPI_CS_PIN);
 
-#define CAN_SPEED CAN_100KBPS
-#define CAN_CLOCK MCP_16MHZ
-
-// Identifiants CAN
-#define ID_IM_FVD   0x0E880000  // Input Message Feux Avant Droit
-#define ID_AIM_FVD  0x0EA00000  // Acquittement IM Feux Avant Droit
-
-#define REG_GPDDR  0x1F         // Registre direction GPIO
-#define REG_GPLAT  0x1E         // Registre état GPIO
-#define MASK_FVD   0x0F         // Masque pour les 4 bits LSB
-
-#define TEMPO_FEUX 3500         // 3.5s pour cycle feux
-#define TEMPO_CLIGNOT 1600      // 1.6s pour clignotant
-
-// Structure pour l'état des feux FVD
 struct {
   uint8_t veilleuse : 1;
   uint8_t code      : 1;
@@ -30,177 +47,157 @@ struct {
   uint8_t clign_d   : 1;
 } commandes;
 
-unsigned long dernier_changement = 0;
-unsigned long dernier_clignotement = 0;
-bool clignotant_actif = false;
+unsigned long t_prev_feux = 0;
+unsigned long t_prev_cligno = 0;
+bool clignotant_on = false;
 
-// ==============================================
-// FONCTION : Afficher l'état des feux
-// ==============================================
+// ============================================================================
+    // AFFICHAGE DE L’ÉTAT DES FEUX
+// ============================================================================
 void printFeuxStatus() {
-  Serial.println("\n[ETAT DES FEUX - FVD]");
+  Serial.println("\n[ÉTAT DES FEUX - " NOM_BLOC "]");
   Serial.print("  Veilleuse : "); Serial.println(commandes.veilleuse ? "ON" : "OFF");
   Serial.print("  Code      : "); Serial.println(commandes.code ? "ON" : "OFF");
   Serial.print("  Phare     : "); Serial.println(commandes.phare ? "ON" : "OFF");
-  Serial.print("  Cligno D  : "); Serial.println(commandes.clign_d ? "ON" : "OFF");
-  
+  Serial.print("  Clignotant: "); Serial.println(commandes.clign_d ? "ON" : "OFF");
+
   uint8_t val = (commandes.clign_d << 3) | (commandes.phare << 2) |
                 (commandes.code << 1) | commandes.veilleuse;
+
   Serial.print("  Valeur binaire : 0b");
   for (int8_t i = 3; i >= 0; i--) Serial.print((val >> i) & 1);
   Serial.print(" (0x"); Serial.print(val, HEX); Serial.println(")");
-  Serial.println("----------------------------------");
+  Serial.println("----------------------------------------");
 }
 
-// ==============================================
-// FONCTION : Initialisation CAN
-// ==============================================
+// ============================================================================
+    // INITIALISATION CAN
+// ============================================================================
 bool initCAN() {
-  if (mcp2515.reset() != MCP2515::ERROR_OK) {
-    Serial.println("[ERREUR] Reset CAN failed");
-    return false;
-  }
-  if (mcp2515.setBitrate(CAN_SPEED, CAN_CLOCK) != MCP2515::ERROR_OK) {
-    Serial.println("[ERREUR] Configuration bitrate");
-    return false;
-  }
-  if (mcp2515.setNormalMode() != MCP2515::ERROR_OK) {
-    Serial.println("[ERREUR] Mode normal");
-    return false;
-  }
+  if (mcp2515.reset() != MCP2515::ERROR_OK) return false;
+  if (mcp2515.setBitrate(CAN_SPEED, CAN_CLOCK) != MCP2515::ERROR_OK) return false;
+  if (mcp2515.setNormalMode() != MCP2515::ERROR_OK) return false;
   return true;
 }
 
-// ==============================================
-// FONCTION : Envoi avec acquittement
-// ==============================================
+// ============================================================================
+   //  ENVOI DE TRAME AVEC ACQUITTEMENT
+// ============================================================================
 bool sendWithAck(uint32_t id, uint32_t ack_id, uint8_t reg, uint8_t mask, uint8_t value) {
   struct can_frame frame;
   frame.can_id  = id | CAN_EFF_FLAG;  // Mode étendu
-  frame.can_dlc = 3;                  // 3 octets de données
-  frame.data[0] = reg;                // Registre cible
-  frame.data[1] = mask;               // Masque
-  frame.data[2] = value;              // Valeur
-
-  // Affichage détaillé de la trame envoyée
-  Serial.println("\n[ENVOI TRAME]");
-  Serial.print("  [RX]ID: 0x"); Serial.println(id, HEX);
-  Serial.print("  Registre: 0x"); Serial.println(reg, HEX);
-  Serial.print("  Masque: 0b"); 
-  for (int8_t i = 7; i >= 0; i--) Serial.print((mask >> i) & 1);
-  Serial.print(" (0x"); Serial.print(mask, HEX); Serial.println(")");
-  Serial.print("  Valeur: 0b"); 
-  for (int8_t i = 7; i >= 0; i--) Serial.print((value >> i) & 1);
-  Serial.print(" (0x"); Serial.print(value, HEX); Serial.println(")");
+  frame.can_dlc = 3;
+  frame.data[0] = reg;
+  frame.data[1] = mask;
+  frame.data[2] = value;
 
   if (mcp2515.sendMessage(&frame) != MCP2515::ERROR_OK) {
-    Serial.println("[ERREUR] Envoi trame");
+    Serial.println("[ERREUR] Envoi CAN");
     return false;
   }
 
-  // Attente acquittement
-  struct can_frame ack_frame;
+  struct can_frame ack;
   unsigned long t0 = millis();
-  while (millis() - t0 < 500) {  // Timeout 500ms
-    if (mcp2515.readMessage(&ack_frame) == MCP2515::ERROR_OK) {
-      if ((ack_frame.can_id & 0x1FFFFFFF) == ack_id) {
-        Serial.println("\n[ACQUITTEMENT RECU]");
-        Serial.print(" [TX]ID: 0x"); Serial.println(ack_id, HEX);
-        Serial.print("  Module: Feux Avant Droit");
-        Serial.println("\n----------------------------------");
+  while (millis() - t0 < 500) {
+    if (mcp2515.readMessage(&ack) == MCP2515::ERROR_OK) {
+      if ((ack.can_id & 0x1FFFFFFF) == ack_id) {
+        Serial.println("[ACQUITTEMENT OK]");
         return true;
       }
     }
   }
-  Serial.println("[ERREUR] Timeout acquittement");
+  Serial.println("[TIMEOUT] Aucun acquittement");
   return false;
 }
 
-// ==============================================
-// FONCTION : Mise à jour cycle feux
-// ==============================================
+// ============================================================================
+    //  MISE À JOUR DU CYCLE DES FEUX PRINCIPAUX
+// ============================================================================
 void updateFeux() {
-  static uint8_t cycle = 0;
+  static uint8_t etape = 0;
 
-  Serial.print("\n[CYCLE FEUX] Phase "); Serial.println(cycle);
-  
-  // Séquence: OFF -> Veilleuse -> Code -> Phare
-  switch (cycle) {
-    case 0:  // Tout éteint
-      commandes.veilleuse = 0; 
-      commandes.code = 0; 
-      commandes.phare = 0; 
+  // Réinitialise tout
+  commandes.veilleuse = 0;
+  commandes.code      = 0;
+  commandes.phare     = 0;
+
+  // Applique la logique du cycle "cumulatif"
+  switch (etape) {
+    case 1:
+      commandes.veilleuse = 1;
       break;
-    case 1:  // Veilleuse
-      commandes.veilleuse = 1; 
+    case 2:
+      commandes.veilleuse = 1;
+      commandes.code = 1;
       break;
-    case 2:  // Code
-      commandes.code = 1; 
+    case 3:
+      commandes.veilleuse = 1;
+      commandes.phare = 1;
       break;
-    case 3:  // Phare
-      commandes.code = 0; 
-      commandes.phare = 1; 
+    default:
+      // Étape 0 : tout éteint
       break;
   }
-  cycle = (cycle + 1) % 4;
 
-  // Construction valeur et envoi
-  uint8_t val_fvd = (commandes.clign_d << 3) | (commandes.phare << 2) |
-                    (commandes.code << 1) | commandes.veilleuse;
-  sendWithAck(ID_IM_FVD, ID_AIM_FVD, REG_GPLAT, MASK_FVD, val_fvd);
+  // Passage à l’étape suivante
+  etape = (etape + 1) % 4;
+
+  // Envoie la trame mise à jour
+  uint8_t val = (commandes.clign_d << 3) | (commandes.phare << 2) |
+                (commandes.code << 1) | commandes.veilleuse;
+
+  sendWithAck(ID_IM_BLOC, ID_AIM_BLOC, REG_GPLAT, MASK_BLOC, val);
   printFeuxStatus();
 }
 
-// ==============================================
-// SETUP
-// ==============================================
+// ============================================================================
+   //  SETUP PRINCIPAL
+// ============================================================================
 void setup() {
   Serial.begin(115200);
-  while (!Serial); // Attente connexion série
+  while (!Serial);
   SPI.begin();
-  
-  Serial.println("\nInitialisation CAN...");
+
+  Serial.println("[INIT] Initialisation CAN...");
   if (!initCAN()) {
-    Serial.println("[ERREUR] Initialisation CAN echouee");
-    while (1); // Boucle infinie
-  }
-  
-  // Initialisation état feux
-  commandes = {0, 0, 0, 0};
-  
-  // Configuration initiale des GPIO en sortie
-  if (!sendWithAck(ID_IM_FVD, ID_AIM_FVD, REG_GPDDR, 0x0F, 0x00)) {
-    Serial.println("[ERREUR] Config GPIO");
+    Serial.println("[ERREUR] CAN non initialisé");
     while (1);
   }
-  
-  Serial.println("\n[SYSTEME PRET] Controle Feux Avant Droit");
-  Serial.println("==================================");
+
+  // Initialisation GPIO en sortie
+  if (!sendWithAck(ID_IM_BLOC, ID_AIM_BLOC, REG_GPDDR, MASK_BLOC, 0x00)) {
+    Serial.println("[ERREUR] Configuration GPIO");
+    while (1);
+  }
+
+  commandes = {0, 0, 0, 0};
+  Serial.println("[SYSTEME PRET] Contrôle des feux " NOM_BLOC);
 }
 
-// ==============================================
-// LOOP
-// ==============================================
+// ============================================================================
+     //  LOOP
+// ============================================================================
 void loop() {
   unsigned long now = millis();
 
-  // Gestion cycle feux principal
-  if (now - dernier_changement >= TEMPO_FEUX) {
-    dernier_changement = now;
+  // Séquence cyclique des feux (veilleuse → code → phare)
+  if (now - t_prev_feux >= TEMPO_FEUX) {
+    t_prev_feux = now;
     updateFeux();
   }
 
-  // Gestion clignotant indépendant
-  if (now - dernier_clignotement >= TEMPO_CLIGNOT) {
-    dernier_clignotement = now;
-    clignotant_actif = !clignotant_actif;
-    commandes.clign_d = clignotant_actif ? 1 : 0;
+  // Clignotement (bit 3)
+  if (now - t_prev_cligno >= TEMPO_CLIGNOT) {
+    t_prev_cligno = now;
+    clignotant_on = !clignotant_on;
+    commandes.clign_d = clignotant_on;
 
-    uint8_t val_fvd = (commandes.clign_d << 3) | (commandes.phare << 2) |
-                      (commandes.code << 1) | commandes.veilleuse;
-    sendWithAck(ID_IM_FVD, ID_AIM_FVD, REG_GPLAT, MASK_FVD, val_fvd);
+    uint8_t val = (commandes.clign_d << 3) | (commandes.phare << 2) |
+                  (commandes.code << 1) | commandes.veilleuse;
+
+    sendWithAck(ID_IM_BLOC, ID_AIM_BLOC, REG_GPLAT, MASK_BLOC, val);
     printFeuxStatus();
   }
-  
-  delay(100); // Petite pause
+
+  delay(50);  // Légère pause
 }
