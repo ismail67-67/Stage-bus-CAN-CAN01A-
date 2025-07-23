@@ -65,7 +65,7 @@ void configurerModule() {
 
 // Affiche l’état de chaque feu dans un format lisible
 void afficherEtatFeux(uint8_t boutons) {
-  Serial.println("\n==== ETAT FEUX COMMODO ====");
+  Serial.println("==== ETAT FEUX COMMODO ====");
   Serial.print("Clignotant Gauche: "); Serial.println(boutons & MASK_CLIGN_G    ? "ACTIF" : "inactif");
   Serial.print("Clignotant Droit : "); Serial.println(boutons & MASK_CLIGN_D    ? "ACTIF" : "inactif");
   Serial.print("Stop             : "); Serial.println(boutons & MASK_STOP       ? "ACTIF" : "inactif");
@@ -74,7 +74,7 @@ void afficherEtatFeux(uint8_t boutons) {
   Serial.print("Phare            : "); Serial.println(boutons & MASK_PHARE      ? "ACTIF" : "inactif");
   Serial.print("Code             : "); Serial.println(boutons & MASK_CODE       ? "ACTIF" : "inactif");
   Serial.print("Warning          : "); Serial.println(boutons & MASK_WARNING    ? "ACTIF" : "inactif");
-  Serial.println("===========================\n");
+  Serial.println("===========================");
 }
 
 // Envoie la commande combinée (logique TOR) vers le module
@@ -126,8 +126,8 @@ void traiterMessageCAN(can_frame trame) {
   else if (id == ID_AIM_COMMODO && ackPending && !ackPrinted) {
     Serial.print("[RX] ACK depuis 0x"); Serial.print(ID_AIM_COMMODO, HEX);
     Serial.print(" : 0x"); Serial.print(trame.data[2], HEX);
-    Serial.print(" (0b"); Serial.print(trame.data[2], BIN); Serial.println(")");
-
+    Serial.print(" (0b"); Serial.print(trame.data[2], BIN); Serial.println(")\n");
+    Serial.print("----------------------------------------\n");
     ackPrinted  = true;
     ackPending  = false;
   }
