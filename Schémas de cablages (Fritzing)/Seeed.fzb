@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<module fritzingVersion="0.9.3b.04.19.5c895d327c44a3114e5fcc9d8260daf0cbb52806" icon="Mine.png">
+    <title>Seeed</title>
+    <instances>
+        <instance moduleIdRef="arch_pro_v1" modelIndex="149282" path="E:/fritzing.0.9.3b/fritzing.0.9.3b.64.pc/fritzing-parts/core/seeed_arch_pro_v1.fzp">
+            <views/>
+        </instance>
+        <instance moduleIdRef="arch_v1.1" modelIndex="149283" path="E:/fritzing.0.9.3b/fritzing.0.9.3b.64.pc/fritzing-parts/core/seeed_arch_v1.1.fzp">
+            <views/>
+        </instance>
+        <instance moduleIdRef="arch_ble_82babccb63a29a72165a2ae668791ae2_33" modelIndex="149299" path="C:/Users/hadda/Documents/Fritzing/parts/contrib/arch_ble_82babccb63a29a72165a2ae668791ae2_33.fzp">
+            <views/>
+        </instance>
+        <instance moduleIdRef="seeeduino_v3" modelIndex="149284" path="E:/fritzing.0.9.3b/fritzing.0.9.3b.64.pc/fritzing-parts/core/seeed_seeeduino_v3.fzp">
+            <views/>
+        </instance>
+        <instance moduleIdRef="grove_light_sensor" modelIndex="149285" path="E:/fritzing.0.9.3b/fritzing.0.9.3b.64.pc/fritzing-parts/core/seeed_grove_light_sensor.fzp">
+            <views/>
+        </instance>
+        <instance moduleIdRef="grove_temperature_sensor" modelIndex="149286" path="E:/fritzing.0.9.3b/fritzing.0.9.3b.64.pc/fritzing-parts/core/seeed_grove_temperature_sensor.fzp">
+            <views/>
+        </instance>
+        <instance moduleIdRef="grove_infrared_receiver" modelIndex="149287" path="E:/fritzing.0.9.3b/fritzing.0.9.3b.64.pc/fritzing-parts/core/seeed_grove_infrared_receiver.fzp">
+            <views/>
+        </instance>
+        <instance moduleIdRef="grove_infrared_emitter" modelIndex="149288" path="E:/fritzing.0.9.3b/fritzing.0.9.3b.64.pc/fritzing-parts/core/seeed_grove_infrared_emitter.fzp">
+            <views/>
+        </instance>
+        <instance moduleIdRef="grove_buzz" modelIndex="149289" path="E:/fritzing.0.9.3b/fritzing.0.9.3b.64.pc/fritzing-parts/core/seeed_grove_buzz.fzp">
+            <views/>
+        </instance>
+        <instance moduleIdRef="grove_button" modelIndex="149290" path="E:/fritzing.0.9.3b/fritzing.0.9.3b.64.pc/fritzing-parts/core/seeed_grove_button.fzp">
+            <views/>
+        </instance>
+        <instance moduleIdRef="grove_3axis_digital_accelerometer_16g" modelIndex="149291" path="E:/fritzing.0.9.3b/fritzing.0.9.3b.64.pc/fritzing-parts/core/seeed_grove_3axis_digital_accelerometer_16g.fzp">
+            <views/>
+        </instance>
+        <instance moduleIdRef="grove_potentiometer_c62032f7ee35ddfe7b9a0e6976db948f_3" modelIndex="149292" path="C:/Users/hadda/Documents/Fritzing/parts/contrib/grove_potentiometer_c62032f7ee35ddfe7b9a0e6976db948f_3.fzp">
+            <views/>
+        </instance>
+        <instance moduleIdRef="grove_chainable_rgb_led_274e57ac0b7cbfe5c9225af54fbb68b5_15" modelIndex="149293" path="C:/Users/hadda/Documents/Fritzing/parts/contrib/grove_chainable_rgb_led_274e57ac0b7cbfe5c9225af54fbb68b5_15.fzp">
+            <views/>
+        </instance>
+        <instance moduleIdRef="grove_4digit_display" modelIndex="149294" path="E:/fritzing.0.9.3b/fritzing.0.9.3b.64.pc/fritzing-parts/core/seeed_grove_4digit_display.fzp">
+            <views/>
+        </instance>
+        <instance moduleIdRef="grove_oled_128x96" modelIndex="149295" path="E:/fritzing.0.9.3b/fritzing.0.9.3b.64.pc/fritzing-parts/core/seeed_grove_oled_128x96.fzp">
+            <views/>
+        </instance>
+        <instance moduleIdRef="base_shield_v2_cd2b6af6e135ba0da8257ba9f2af9844_14" modelIndex="149296" path="C:/Users/hadda/Documents/Fritzing/parts/contrib/base_shield_v2_cd2b6af6e135ba0da8257ba9f2af9844_14.fzp">
+            <views/>
+        </instance>
+        <instance moduleIdRef="ble_micro_623fcaf5dbccd172d16928552d92504c_13" modelIndex="149297" path="C:/Users/hadda/Documents/Fritzing/parts/contrib/ble_micro_623fcaf5dbccd172d16928552d92504c_13.fzp">
+            <views/>
+        </instance>
+        <instance moduleIdRef="tiny_ble_25bbf3726c16cf5e50695e3048eac21f_1" modelIndex="149298" path="C:/Users/hadda/Documents/Fritzing/parts/contrib/tiny_ble_25bbf3726c16cf5e50695e3048eac21f_1.fzp">
+            <views/>
+        </instance>
+        <instance moduleIdRef="lisa_ad06579d65071869cae244859b8af13a_2" modelIndex="149300" path="C:/Users/hadda/Documents/Fritzing/parts/contrib/lisa_ad06579d65071869cae244859b8af13a_2.fzp">
+            <views/>
+        </instance>
+    </instances>
+</module>
