@@ -1,44 +1,37 @@
-/*******************************************************************************
-* TP3 – Contrôle des feux d’un bloc optique via CAN (VMD - MCP2515)
-* Séquence : Clignotant droit independent des feux chaque 1.6s → Veilleuse → Veilleuse+Code → Veilleuse+Phare → Eteint → ...
-* Arduino Uno R3 + MCP2515 – Feux Avant Droit (modifiable)
+/******************************************************************************
+ * TP3 – Contrôle cyclique d’un bloc optique via CAN (MCP2515 - VMD)
+ * --------------------------------------------------------------------------
+ * Séquence : Clignotant droit independent des feux chaque 1.6s → Veilleuse → Veilleuse+Code → Veilleuse+Phare → Eteint → ...
+ * - Utilisation de l’interruption matérielle (INT) pour réception d’ACK.
+ * - Pas de polling actif
+ * - Feux Avant Droit (modifiable)
+ * Matériel : Arduino Uno R3 + Shield CAN MCP2515 (INT sur D2 recommandé)
  ******************************************************************************/
 
 #include <SPI.h>
 #include <mcp2515.h>
 
-// ============================================================================
-    // CONFIGURATION PRINCIPALE
-// ============================================================================
+//========== CONFIGURATION GÉNÉRALE ==========
 
-// === Bloc cible à modifier facilement ici ===
-#define NOM_BLOC      "FVG"           // Nom pour affichage (ex: "FVD", "FVG", "ARD")
-#define ID_IM_BLOC    0x0E080000      // ID de trame IM (Input Message) {Rx}
-#define ID_AIM_BLOC   0x0E200000      // ID de trame AIM (Ack Input Message) {TX}
+#define SPI_CS_PIN      9           // Broche CS du MCP2515
+#define INT_PIN         2           // Broche d'interruption (INT MCP2515 → D2)
+#define CAN_SPEED       CAN_100KBPS
+#define CAN_CLOCK       MCP_16MHZ
 
-// Pour utiliser d'autres modules VMD (changer ID_IM et ID_AIM si besoin) :
-//  Avant gauche  : RX=0x0E080000 TX=0x0E200000
-//  Avant droite  : RX=0x0E880000 TX=0x0EA00000
+#define NOM_BLOC        "FAD"       // Nom du bloc (ex : FVD = Feux Avant Droit)
+#define ID_IM_BLOC      0x0E880000  // ID trame IM  (commande vers bloc)
+#define ID_AIM_BLOC     0x0EA00000  // ID trame AIM (acquittement depuis bloc)
 
-// === CAN ===
-#define SPI_CS_PIN    9
-#define CAN_SPEED     CAN_100KBPS
-#define CAN_CLOCK     MCP_16MHZ
+#define REG_GPDDR       0x1F        // Registre de direction (entrée/sortie)
+#define REG_GPLAT       0x1E        // Registre de latence (valeurs des GPIO)
+#define MASK_BLOC       0x0F        // GP0–GP3 utilisés (veilleuse à clignotant)
 
-// === Registres GPIO du MCP25050 ===
-#define REG_GPDDR     0x1F            // Direction des GPIO
-#define REG_GPLAT     0x1E            // État des GPIO
-#define MASK_BLOC     0x0F            // Masque pour bits 0–3
+#define TEMPO_FEUX      3500        // Durée entre états de feux (ms)
+#define TEMPO_CLIGNOT   1600        // Fréquence clignotant droit (ms)
 
-// === Temps (en ms) ===
-#define TEMPO_FEUX     3500           // 3.5 s entre chaque étape des feux
-#define TEMPO_CLIGNOT  1600           // 1.6 s pour le clignotement
+MCP2515 mcp2515(SPI_CS_PIN);       // Instance du contrôleur CAN
 
-// ============================================================================
-    // VARIABLES GLOBALES
-// ============================================================================
-
-MCP2515 mcp2515(SPI_CS_PIN);
+//========== STRUCTURE ÉTAT DES FEUX ==========
 
 struct {
   uint8_t veilleuse : 1;
@@ -47,14 +40,35 @@ struct {
   uint8_t clign_d   : 1;
 } commandes;
 
-unsigned long t_prev_feux = 0;
-unsigned long t_prev_cligno = 0;
+unsigned long t_prev_feux    = 0;
+unsigned long t_prev_cligno  = 0;
 bool clignotant_on = false;
 
-// ============================================================================
-    // AFFICHAGE DE L’ÉTAT DES FEUX
-// ============================================================================
-void printFeuxStatus() {
+volatile bool ackRecu       = false;   // Flag déclenché par l'interruption
+volatile bool attenteAck    = false;   // Signal qu'on attend un ACK
+
+//========== INITIALISATION DU BUS CAN ==========
+
+bool initialiserCAN() {
+  if (mcp2515.reset() != MCP2515::ERROR_OK) return false;
+  if (mcp2515.setBitrate(CAN_SPEED, CAN_CLOCK) != MCP2515::ERROR_OK) return false;
+  if (mcp2515.setNormalMode() != MCP2515::ERROR_OK) return false;
+  return true;
+}
+
+bool configurerSortieGPIO() {
+  struct can_frame frame;
+  frame.can_id  = ID_IM_BLOC | CAN_EFF_FLAG;
+  frame.can_dlc = 3;
+  frame.data[0] = REG_GPDDR;     // Registre direction
+  frame.data[1] = MASK_BLOC;     // Cible : GP0 à GP3
+  frame.data[2] = 0x00;          // 0 = Sortie
+  return (mcp2515.sendMessage(&frame) == MCP2515::ERROR_OK);
+}
+
+//========== AFFICHAGE DÉTAILLÉ SUR MONITEUR ==========
+
+void afficherEtatFeux() {
   Serial.println("\n[ÉTAT DES FEUX - " NOM_BLOC "]");
   Serial.print("  Veilleuse : "); Serial.println(commandes.veilleuse ? "ON" : "OFF");
   Serial.print("  Code      : "); Serial.println(commandes.code ? "ON" : "OFF");
@@ -70,134 +84,121 @@ void printFeuxStatus() {
   Serial.println("----------------------------------------");
 }
 
-// ============================================================================
-    // INITIALISATION CAN
-// ============================================================================
-bool initCAN() {
-  if (mcp2515.reset() != MCP2515::ERROR_OK) return false;
-  if (mcp2515.setBitrate(CAN_SPEED, CAN_CLOCK) != MCP2515::ERROR_OK) return false;
-  if (mcp2515.setNormalMode() != MCP2515::ERROR_OK) return false;
-  return true;
-}
+//========== ENVOI DE COMMANDE AVEC GESTION D’ACK ==========
 
-// ============================================================================
-   //  ENVOI DE TRAME AVEC ACQUITTEMENT
-// ============================================================================
-bool sendWithAck(uint32_t id, uint32_t ack_id, uint8_t reg, uint8_t mask, uint8_t value) {
+bool envoyerCommande(uint8_t val) {
   struct can_frame frame;
-  frame.can_id  = id | CAN_EFF_FLAG;  // Mode étendu
+  frame.can_id  = ID_IM_BLOC | CAN_EFF_FLAG;
   frame.can_dlc = 3;
-  frame.data[0] = reg;
-  frame.data[1] = mask;
-  frame.data[2] = value;
+  frame.data[0] = REG_GPLAT;
+  frame.data[1] = MASK_BLOC;
+  frame.data[2] = val;
+
+  ackRecu = false;
+  attenteAck = true;
 
   if (mcp2515.sendMessage(&frame) != MCP2515::ERROR_OK) {
-    Serial.println("[ERREUR] Envoi CAN");
+    Serial.println("[ERREUR] Échec d’envoi CAN");
     return false;
   }
 
-  struct can_frame ack;
+  // Attend l’interruption ou timeout
   unsigned long t0 = millis();
-  while (millis() - t0 < 500) {
-    if (mcp2515.readMessage(&ack) == MCP2515::ERROR_OK) {
-      if ((ack.can_id & 0x1FFFFFFF) == ack_id) {
-        Serial.println("[ACQUITTEMENT OK]");
-        return true;
-      }
-    }
-  }
-  Serial.println("[TIMEOUT] Aucun acquittement");
+  while (attenteAck && (millis() - t0 < 500));
+
+  if (ackRecu) return true;
+
+  Serial.println("[TIMEOUT] Aucun ACK reçu");
   return false;
 }
 
-// ============================================================================
-    //  MISE À JOUR DU CYCLE DES FEUX PRINCIPAUX
-// ============================================================================
-void updateFeux() {
+//========== ROUTINE D’INTERRUPTION CAN ==========
+
+void interruptionCAN() {
+  struct can_frame frame;
+  while (mcp2515.readMessage(&frame) == MCP2515::ERROR_OK) {
+    uint32_t id = frame.can_id & 0x1FFFFFFF;
+    if (id == ID_AIM_BLOC) {
+      ackRecu = true;
+      attenteAck = false;
+      Serial.print("[ACK] Reçu de 0x"); Serial.print(ID_AIM_BLOC, HEX);
+      Serial.print(" → Valeur : 0x"); Serial.println(frame.data[2], HEX);
+    }
+  }
+}
+
+//========== MISE À JOUR DE LA SÉQUENCE DE FEUX ==========
+
+void miseAJourFeux() {
   static uint8_t etape = 0;
+  commandes = {0, 0, 0, commandes.clign_d};  // Reset sauf clignotant
 
-  // Réinitialise tout
-  commandes.veilleuse = 0;
-  commandes.code      = 0;
-  commandes.phare     = 0;
-
-  // Applique la logique du cycle "cumulatif"
   switch (etape) {
-    case 1:
-      commandes.veilleuse = 1;
-      break;
-    case 2:
-      commandes.veilleuse = 1;
-      commandes.code = 1;
-      break;
-    case 3:
-      commandes.veilleuse = 1;
-      commandes.phare = 1;
-      break;
-    default:
-      // Étape 0 : tout éteint
-      break;
+    case 1: commandes.veilleuse = 1; break;
+    case 2: commandes.veilleuse = commandes.code = 1; break;
+    case 3: commandes.veilleuse = commandes.phare = 1; break;
+    default: break;  // Étape 0 : tout éteint
   }
 
-  // Passage à l’étape suivante
   etape = (etape + 1) % 4;
 
-  // Envoie la trame mise à jour
   uint8_t val = (commandes.clign_d << 3) | (commandes.phare << 2) |
                 (commandes.code << 1) | commandes.veilleuse;
 
-  sendWithAck(ID_IM_BLOC, ID_AIM_BLOC, REG_GPLAT, MASK_BLOC, val);
-  printFeuxStatus();
+  envoyerCommande(val);
+  afficherEtatFeux();
 }
 
-// ============================================================================
-   //  SETUP PRINCIPAL
-// ============================================================================
+//========== CLIGNOTANT DROIT (AUTONOME) ==========
+
+void miseAJourClignotant() {
+  clignotant_on = !clignotant_on;
+  commandes.clign_d = clignotant_on;
+
+  uint8_t val = (commandes.clign_d << 3) | (commandes.phare << 2) |
+                (commandes.code << 1) | commandes.veilleuse;
+
+  envoyerCommande(val);
+  afficherEtatFeux();
+}
+
+//========== SETUP PRINCIPAL ==========
+
 void setup() {
   Serial.begin(115200);
   while (!Serial);
   SPI.begin();
 
-  Serial.println("[INIT] Initialisation CAN...");
-  if (!initCAN()) {
-    Serial.println("[ERREUR] CAN non initialisé");
+  pinMode(INT_PIN, INPUT);
+  attachInterrupt(digitalPinToInterrupt(INT_PIN), interruptionCAN, FALLING);
+
+  Serial.println("[INIT] Initialisation du bus CAN...");
+  if (!initialiserCAN()) {
+    Serial.println("[ERREUR FATALE] Bus CAN non opérationnel !");
     while (1);
   }
 
-  // Initialisation GPIO en sortie
-  if (!sendWithAck(ID_IM_BLOC, ID_AIM_BLOC, REG_GPDDR, MASK_BLOC, 0x00)) {
-    Serial.println("[ERREUR] Configuration GPIO");
+  if (!configurerSortieGPIO()) {
+    Serial.println("[ERREUR] Configuration GPIO échouée !");
     while (1);
   }
 
   commandes = {0, 0, 0, 0};
-  Serial.println("[SYSTEME PRET] Contrôle des feux " NOM_BLOC);
+  Serial.println("[PRÊT] Système opérationnel pour le bloc " NOM_BLOC);
 }
 
-// ============================================================================
-     //  LOOP
-// ============================================================================
+//========== LOOP PRINCIPALE ==========
+
 void loop() {
   unsigned long now = millis();
 
-  // Séquence cyclique des feux (veilleuse → code → phare)
   if (now - t_prev_feux >= TEMPO_FEUX) {
     t_prev_feux = now;
-    updateFeux();
+    miseAJourFeux();
   }
 
-  // Clignotement (bit 3)
   if (now - t_prev_cligno >= TEMPO_CLIGNOT) {
     t_prev_cligno = now;
-    clignotant_on = !clignotant_on;
-    commandes.clign_d = clignotant_on;
-
-    uint8_t val = (commandes.clign_d << 3) | (commandes.phare << 2) |
-                  (commandes.code << 1) | commandes.veilleuse;
-
-    sendWithAck(ID_IM_BLOC, ID_AIM_BLOC, REG_GPLAT, MASK_BLOC, val);
-    printFeuxStatus();
+    miseAJourClignotant();
   }
-
-  delay(50);  // Légère pause
 }
